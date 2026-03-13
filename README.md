@@ -13,10 +13,8 @@
   <a href="repo-tokens"><img src="repo-tokens/badge.svg" alt="34.9k tokens, 17% of context window" valign="middle"></a>
 </p>
 
-<div align="center">
-<br>
-<h2>🐳 Now Running in Docker Sandboxes</h2>
-<p>Every agent gets its own isolated container inside a micro VM.<br>Hypervisor-level isolation. Millisecond startup. No complex setup.</p>
+<h2 align="center">🐳 Now Running in Docker Sandboxes</h2>
+<p align="center">Every agent gets its own isolated container inside a micro VM.<br>Hypervisor-level isolation. Millisecond startup. No complex setup.</p>
 
 **macOS (Apple Silicon)**
 ```bash
@@ -28,11 +26,9 @@ curl -fsSL https://nanoclaw.dev/install-docker-sandboxes.sh | bash
 curl -fsSL https://nanoclaw.dev/install-docker-sandboxes-windows.sh | bash
 ```
 
-<p>Currently supported on macOS (Apple Silicon) and Windows (x86). Linux support coming soon.</p>
+> Currently supported on macOS (Apple Silicon) and Windows (x86). Linux support coming soon.
 
-<p><a href="https://nanoclaw.dev/blog/nanoclaw-docker-sandboxes">Read the announcement →</a></p>
-<br>
-</div>
+<p align="center"><a href="https://nanoclaw.dev/blog/nanoclaw-docker-sandboxes">Read the announcement →</a></p>
 
 ## Why I Built NanoClaw
 
