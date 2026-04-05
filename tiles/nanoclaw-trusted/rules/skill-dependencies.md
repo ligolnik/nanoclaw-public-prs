@@ -12,8 +12,7 @@ Skills that invoke or depend on other skills. Read this to understand execution 
 1. Reads Google Calendar via Composio (Step 1)
 2. Reads Google Tasks via Composio (Step 2)
 3. Runs `morning-brief-fetch.py` script (Step 3) — reads `morning-brief-pending.json`
-4. Runs `.py` script (Step 4a) — reads CFP state
-5. Calls `check-calendar` internally (Step 8) — sets up reminders
+4. Calls `check-calendar` internally (Step 8) — sets up reminders
 6. Updates `task-tz-state.json` with `last_run_date` (Step 9)
 
 ## Nightly Housekeeping (runs daily, 11pm local)
@@ -33,4 +32,3 @@ Skills that invoke or depend on other skills. Read this to understand execution 
 | `morning-brief-pending.json` | nightly-housekeeping (Step 6) | morning-brief (Step 3) |
 | `session-state.json` | any skill (pending response tracking) | heartbeat (pending response check) |
 | `calendar-state.json` | check-calendar | check-calendar (diff against previous) |
-| `cfp-state.json` | check-cfps | check-cfps, .py |
