@@ -58,6 +58,17 @@ interface VolumeMount {
   readonly: boolean;
 }
 
+function chownRecursive(dir: string, uid: number, gid: number): void {
+  fs.chownSync(dir, uid, gid);
+  for (const entry of fs.readdirSync(dir, { withFileTypes: true })) {
+    const fullPath = path.join(dir, entry.name);
+    fs.chownSync(fullPath, uid, gid);
+    if (entry.isDirectory()) {
+      chownRecursive(fullPath, uid, gid);
+    }
+  }
+}
+
 function buildVolumeMounts(
   group: RegisteredGroup,
   isMain: boolean,
@@ -178,6 +189,18 @@ function buildVolumeMounts(
       fs.cpSync(srcDir, dstDir, { recursive: true });
     }
   }
+  // Chown .claude session dir so the container user (node) can write to it.
+  // The orchestrator may create this dir as root; SDK needs to mkdir session-env/ inside.
+  const sessionUid = process.getuid?.();
+  const sessionGid = process.getgid?.();
+  if (sessionUid != null && sessionUid !== 0) {
+    try {
+      chownRecursive(groupSessionsDir, sessionUid, sessionGid ?? sessionUid);
+    } catch (err) {
+      logger.warn({ err, groupSessionsDir }, 'Failed to chown .claude session dir');
+    }
+  }
+
   mounts.push({
     hostPath: groupSessionsDir,
     containerPath: '/home/node/.claude',
