@@ -964,15 +964,18 @@ describe('task scheduler', () => {
     // dropped (host crash, queue shut down mid-tick), the row sits here
     // forever — pruneCompletedTasks would eventually GC it but the
     // schedule is lost. resurrect puts it back in front of the loop.
+    // SQLite's datetime('now') uses the real system clock, not
+    // vi.setSystemTime — so use a far-future next_run that's
+    // guaranteed in the future for the resurrect gate.
     createTask({
       id: 'zombie-once',
       group_folder: 'main',
       chat_jid: 'main@g.us',
       prompt: 'should have run',
       schedule_type: 'once',
-      schedule_value: '2026-01-01T00:00:00.000Z',
+      schedule_value: '2099-01-01T00:00:00.000Z',
       context_mode: 'isolated',
-      next_run: '2026-01-01T00:00:00.000Z',
+      next_run: '2099-01-01T00:00:00.000Z',
       status: 'active',
       created_at: '2026-01-01T00:00:00.000Z',
     });
@@ -985,7 +988,7 @@ describe('task scheduler', () => {
     expect(resurrected).toEqual(['zombie-once']);
     expect(getTaskById('zombie-once')?.status).toBe('active');
     expect(getTaskById('zombie-once')?.next_run).toBe(
-      '2026-01-01T00:00:00.000Z',
+      '2099-01-01T00:00:00.000Z',
     );
   });
 
@@ -1013,6 +1016,65 @@ describe('task scheduler', () => {
     const resurrected = resurrectZombieTasks();
     expect(resurrected).toEqual([]);
     expect(getTaskById('ran-properly')?.status).toBe('completed');
+  });
+
+  it('resurrectZombieTasks ignores zombies whose next_run is in the past (stale schedule)', () => {
+    // Real-world failure mode: an Apr-24 once-task whose dispatch
+    // got marked completed without last_run populated, AND whose
+    // schedule_value was already in the past at that point. Without
+    // the next_run > now gate, every restart resurrects it and it
+    // fires repeatedly into the chat days after the user's intent
+    // has expired. The fix: only revive when next_run is still in
+    // the future (genuinely-interrupted dispatch).
+    //
+    // SQLite's datetime('now') uses the real system clock, so the
+    // test uses a real-past date (1970) instead of vi.setSystemTime.
+    createTask({
+      id: 'stale-zombie',
+      group_folder: 'main',
+      chat_jid: 'main@g.us',
+      prompt: 'expired send',
+      schedule_type: 'once',
+      schedule_value: '1970-01-01T00:00:00.000Z',
+      context_mode: 'isolated',
+      next_run: '1970-01-01T00:00:00.000Z', // in the past
+      status: 'active',
+      created_at: '1970-01-01T00:00:00.000Z',
+    });
+    // Pre-advance shape: status flipped to completed but last_run
+    // never stamped (the agent dropped the dispatch).
+    updateTask('stale-zombie', { status: 'completed' });
+    expect(getTaskById('stale-zombie')?.status).toBe('completed');
+
+    const resurrected = resurrectZombieTasks();
+    expect(resurrected).toEqual([]);
+    // Stays completed — does NOT flip back to active.
+    expect(getTaskById('stale-zombie')?.status).toBe('completed');
+  });
+
+  it('resurrectZombieTasks DOES revive zombies whose next_run is still in the future', () => {
+    // Symmetric positive case to the stale-schedule test above:
+    // a future-scheduled once-task whose dispatch got pre-advanced
+    // to completed but never stamped last_run is the genuine
+    // "interrupted dispatch" the resurrect path is designed for.
+    // Real-future date so SQLite's datetime('now') gate accepts it.
+    createTask({
+      id: 'future-zombie',
+      group_folder: 'main',
+      chat_jid: 'main@g.us',
+      prompt: 'tomorrow send',
+      schedule_type: 'once',
+      schedule_value: '2099-01-01T00:00:00.000Z',
+      context_mode: 'isolated',
+      next_run: '2099-01-01T00:00:00.000Z', // in the future
+      status: 'active',
+      created_at: '2026-04-28T00:00:00.000Z',
+    });
+    updateTask('future-zombie', { status: 'completed' });
+
+    const resurrected = resurrectZombieTasks();
+    expect(resurrected).toEqual(['future-zombie']);
+    expect(getTaskById('future-zombie')?.status).toBe('active');
   });
 
   it('resurrectZombieTasks ignores recurring tasks even if they somehow reach status=completed', () => {

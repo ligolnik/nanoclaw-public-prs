@@ -807,13 +807,32 @@ export function pruneCompletedTasks(maxAgeMs: number): number {
  * be GC'd by the next prune sweep on age.
  */
 export function resurrectZombieTasks(): string[] {
+  // Only resurrect tasks whose `next_run` is in the FUTURE. Stale
+  // tasks with last_run=NULL but next_run in the past are not
+  // "interrupted dispatches" — they're tasks whose schedule already
+  // passed, the scheduler stamped them completed, and the agent
+  // forgot to populate last_run. Pulling them back active makes
+  // them re-fire the moment the orchestrator next loops, sending
+  // a stale prompt to a chat long after the user's intent has
+  // expired.
+  //
+  // Failure mode without this gate: a once-task scheduled for
+  // "send X to group on Apr 24" gets resurrected on every restart
+  // and re-fires through Apr 25, 26, 27... Each restart adds
+  // another stale send.
+  //
+  // The `next_run > now` clause keeps the original intent (revive
+  // dispatches that were genuinely interrupted before their
+  // schedule fired) while excluding everything where the schedule
+  // already passed.
   const rows = db
     .prepare(
       `SELECT id FROM scheduled_tasks
        WHERE status = 'completed'
          AND schedule_type = 'once'
          AND last_run IS NULL
-         AND next_run IS NOT NULL`,
+         AND next_run IS NOT NULL
+         AND next_run > datetime('now')`,
     )
     .all() as { id: string }[];
   if (rows.length === 0) return [];
