@@ -722,8 +722,15 @@ async function runQuery(
       // Adaptive also auto-enables interleaved thinking, which matters for
       // our multi-tool-call agentic workflow. Safe on 4.6/Sonnet 4.6 (both
       // support adaptive and will use it over the deprecated manual mode).
+      //
+      // `display: 'summarized'` is required on Opus 4.7 to get readable
+      // thinking content. Anthropic changed the default to `'omitted'` on
+      // 4.7 (faster streaming, but `block.thinking` comes back as empty
+      // string with only a signature blob). Older models default to
+      // 'summarized' and accept the explicit value as a no-op.
+      //
       // See https://docs.anthropic.com/en/docs/build-with-claude/adaptive-thinking
-      thinking: { type: 'adaptive' as const },
+      thinking: { type: 'adaptive' as const, display: 'summarized' as const },
       // AGENT_EFFORT is set by the orchestrator alongside AGENT_MODEL so
       // cost/latency can be tuned per deploy without rebuilding this image.
       // xhigh is Opus 4.7's recommended default for coding/agentic work
