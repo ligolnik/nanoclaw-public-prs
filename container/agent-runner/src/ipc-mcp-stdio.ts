@@ -145,6 +145,31 @@ server.tool(
     reply_to: z.string().optional().describe('Message ID to reply to'),
   },
   async (args) => {
+    // Path must live under a host-readable mount. Anything else (notably
+    // /tmp — tmpfs inside the container, invisible to the host) gets
+    // dropped silently by the host-side validator. Reject upfront so the
+    // agent gets immediate, actionable feedback instead of fake-success.
+    const allowedPrefixes = [
+      '/workspace/group/',
+      '/workspace/trusted/',
+      '/workspace/extra/',
+    ];
+    if (!allowedPrefixes.some((p) => args.filePath.startsWith(p))) {
+      return {
+        content: [
+          {
+            type: 'text' as const,
+            text:
+              `Path not deliverable: ${args.filePath}. ` +
+              `send_file only sends files from host-readable mounts. ` +
+              `Write the file under /workspace/group/ (your group folder) ` +
+              `instead — /tmp/ is container-only tmpfs and the host can't read it.`,
+          },
+        ],
+        isError: true,
+      };
+    }
+
     if (!fs.existsSync(args.filePath)) {
       return {
         content: [{ type: 'text' as const, text: `File not found: ${args.filePath}` }],
