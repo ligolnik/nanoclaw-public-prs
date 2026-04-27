@@ -470,7 +470,19 @@ async function runQuery(
     `Query input: ${prompt.length} chars, preview="${prompt.replace(/\s+/g, ' ').slice(0, 400)}"`,
   );
 
-  // Poll IPC for follow-up messages and _close sentinel during the query
+  // Poll IPC for the _close sentinel during the query. We deliberately do
+  // NOT drain JSON message files here — there's a race where pollIpc fires
+  // after the SDK has emitted Result and agent-runner has broken out of
+  // the for-await over responses, but BEFORE runQuery returns and
+  // ipcPolling flips to false. In that window, draining a file consumes
+  // it from disk (delete + consumedInputFiles entry) and pushes it into a
+  // stream the SDK has stopped reading from — message is silently lost.
+  // Mid-query draining is also unnecessary: the SDK conversation is
+  // turn-based, and adding a second user message mid-turn doesn't get
+  // processed until after the current turn ends anyway. Letting
+  // waitForIpcMessage drain between queries gives the same throughput
+  // with deterministic delivery — files only disappear when their content
+  // has been read into a string that becomes the next runQuery's prompt.
   let ipcPolling = true;
   let closedDuringQuery = false;
   const pollIpcDuringQuery = () => {
@@ -481,11 +493,6 @@ async function runQuery(
       stream.end();
       ipcPolling = false;
       return;
-    }
-    const messages = drainIpcInput();
-    for (const text of messages) {
-      log(`Piping IPC message into active query (${text.length} chars)`);
-      stream.push(text);
     }
     setTimeout(pollIpcDuringQuery, IPC_POLL_MS);
   };
