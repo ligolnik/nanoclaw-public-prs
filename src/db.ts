@@ -49,7 +49,17 @@ function createSchema(database: Database.Database): void {
       last_run TEXT,
       last_result TEXT,
       status TEXT DEFAULT 'active',
-      created_at TEXT NOT NULL
+      created_at TEXT NOT NULL,
+      -- Continuation marker for self-resuming cycles. NULL for ordinary
+      -- one-shot scheduled tasks. When set by a continuation-aware
+      -- caller (helper skill), the task-scheduler plumbs the value into
+      -- the spawned container as NANOCLAW_CONTINUATION=1 +
+      -- NANOCLAW_CONTINUATION_CYCLE_ID=<value>. Absence of the env vars
+      -- is itself the "fresh invocation" signal the calling skill
+      -- checks for; mismatch between the prompt prefix and these env
+      -- vars fails closed to fresh, never silently takes a
+      -- continuation/lock-skip branch.
+      continuation_cycle_id TEXT
     );
     CREATE INDEX IF NOT EXISTS idx_next_run ON scheduled_tasks(next_run);
     CREATE INDEX IF NOT EXISTS idx_status ON scheduled_tasks(status);
@@ -113,6 +123,22 @@ function createSchema(database: Database.Database): void {
     database.exec(`ALTER TABLE scheduled_tasks ADD COLUMN script TEXT`);
   } catch {
     /* column already exists */
+  }
+
+  // Add continuation_cycle_id column for self-resuming cycles. NULL for
+  // ordinary tasks; set when a continuation-aware caller schedules the
+  // next link of a chain. The task-scheduler reads this value at fire
+  // time and plumbs it onto the spawned container as
+  // NANOCLAW_CONTINUATION=1 + NANOCLAW_CONTINUATION_CYCLE_ID=<value>.
+  // PRAGMA-gated rather than try/catch so the migration failure mode is
+  // visible if it ever matters.
+  const continuationCols = database
+    .prepare('PRAGMA table_info(scheduled_tasks)')
+    .all() as Array<{ name: string }>;
+  if (!continuationCols.some((c) => c.name === 'continuation_cycle_id')) {
+    database.exec(
+      `ALTER TABLE scheduled_tasks ADD COLUMN continuation_cycle_id TEXT`,
+    );
   }
 
   // Add is_bot_message column if it doesn't exist (migration for existing DBs)
@@ -579,8 +605,8 @@ export function createTask(
 ): void {
   db.prepare(
     `
-    INSERT INTO scheduled_tasks (id, group_folder, chat_jid, prompt, script, schedule_type, schedule_value, context_mode, next_run, status, created_at)
-    VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+    INSERT INTO scheduled_tasks (id, group_folder, chat_jid, prompt, script, schedule_type, schedule_value, context_mode, next_run, status, created_at, continuation_cycle_id)
+    VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
   `,
   ).run(
     task.id,
@@ -594,6 +620,7 @@ export function createTask(
     task.next_run,
     task.status,
     task.created_at,
+    task.continuation_cycle_id || null,
   );
 }
 
