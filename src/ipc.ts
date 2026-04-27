@@ -361,8 +361,9 @@ export function startIpcWatcher(deps: IpcDeps): void {
                   isMain ||
                   (targetGroup && targetGroup.folder === sourceGroup)
                 ) {
+                  let sendOk: boolean;
                   if (data.sender && data.chatJid.startsWith('tg:')) {
-                    await sendPoolMessage(
+                    sendOk = await sendPoolMessage(
                       data.chatJid,
                       cleanText,
                       data.sender,
@@ -374,27 +375,43 @@ export function startIpcWatcher(deps: IpcDeps): void {
                       cleanText,
                       data.replyToMessageId,
                     );
+                    sendOk = !!sentMsgId;
                     // Pin the message if requested
                     if (data.pin && sentMsgId && deps.pinMessage) {
                       await deps.pinMessage(data.chatJid, sentMsgId);
                     }
                   }
-                  // Store bot response so heartbeat can track answered messages
-                  storeMessage({
-                    id: `bot-${Date.now()}-${Math.random().toString(36).slice(2, 7)}`,
-                    chat_jid: data.chatJid,
-                    sender: data.sender || ASSISTANT_NAME,
-                    sender_name: data.sender || ASSISTANT_NAME,
-                    content: cleanText,
-                    timestamp: new Date().toISOString(),
-                    is_from_me: true,
-                    is_bot_message: true,
-                    reply_to_message_id: data.replyToMessageId,
-                  });
-                  logger.info(
-                    { chatJid: data.chatJid, sourceGroup },
-                    'IPC message sent',
-                  );
+                  // Only record the bot response in messages.db if
+                  // delivery actually landed. The Telegram channel
+                  // swallows API errors (cross-chat reply_to, rate
+                  // limits, blocked-by-user) and returns a falsy
+                  // value; without this gate we would write a `bot-…`
+                  // row for every send attempt, including failures.
+                  // Heartbeat treats those rows as "the agent
+                  // answered" and downstream agents that quote-reply
+                  // hallucinate a thread that never existed.
+                  if (sendOk) {
+                    storeMessage({
+                      id: `bot-${Date.now()}-${Math.random().toString(36).slice(2, 7)}`,
+                      chat_jid: data.chatJid,
+                      sender: data.sender || ASSISTANT_NAME,
+                      sender_name: data.sender || ASSISTANT_NAME,
+                      content: cleanText,
+                      timestamp: new Date().toISOString(),
+                      is_from_me: true,
+                      is_bot_message: true,
+                      reply_to_message_id: data.replyToMessageId,
+                    });
+                    logger.info(
+                      { chatJid: data.chatJid, sourceGroup },
+                      'IPC message sent',
+                    );
+                  } else {
+                    logger.error(
+                      { chatJid: data.chatJid, sourceGroup },
+                      'IPC message send failed; not storing bot row',
+                    );
+                  }
                 } else {
                   logger.warn(
                     { chatJid: data.chatJid, sourceGroup },

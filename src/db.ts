@@ -475,6 +475,36 @@ export function getMessageById(
   };
 }
 
+/**
+ * Returns true if this message_id is recorded in our DB but in a chat
+ * other than `expectedChatJid`. Returns false when the message is in
+ * `expectedChatJid` OR is absent from our DB entirely (we have no
+ * evidence either way — let the caller proceed).
+ *
+ * Used by the Telegram channel to detect cross-chat reply_to misuse:
+ * when an agent passes a message_id from chat A while sending to
+ * chat B, Telegram returns 400 ("message to be replied not found"),
+ * which the channel's outer catch swallows. Without this check, the
+ * silent failure leaves a phantom bot row in messages.db. Caller
+ * drops the reply_to with a warn when this returns true.
+ *
+ * Per-chat message ID collisions are theoretically possible (Telegram
+ * numbers per chat-bot), so we explicitly filter to chats OTHER than
+ * the expected one rather than returning the message's chat_jid —
+ * a row in `expectedChatJid` should never trigger a drop.
+ */
+export function messageExistsInDifferentChat(
+  messageId: string,
+  expectedChatJid: string,
+): boolean {
+  const row = db
+    .prepare(
+      `SELECT 1 FROM messages WHERE id = ? AND chat_jid != ? LIMIT 1`,
+    )
+    .get(messageId, expectedChatJid) as { '1': number } | undefined;
+  return !!row;
+}
+
 export function storeReaction(reaction: {
   message_id: string;
   message_chat_jid: string;
