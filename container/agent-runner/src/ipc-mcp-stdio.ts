@@ -99,7 +99,7 @@ const server = new McpServer({
 
 server.tool(
   'send_message',
-  "Send a message to the user or group immediately while you're still running. Use this for progress updates or to send multiple messages. You can call this multiple times. Use reply_to with a message ID to quote-reply a specific message.",
+  "Send a message to the user or group immediately while you're still running. Use this for progress updates or to send multiple messages. You can call this multiple times. Use reply_to with a message ID to quote-reply a specific message. To send to a different chat (cross-chat broadcast from main), pass chat_jid — only main containers may target other chats; trusted/untrusted containers can only target their own chat regardless of what's passed (host-side authz enforces this).",
   {
     text: z.string().describe('The message text to send'),
     sender: z
@@ -110,11 +110,17 @@ server.tool(
       ),
     reply_to: z.string().optional().describe('Message ID to reply to (quote). Get this from the [id=...] tag in the message prompt. If omitted, auto-replies to the most recent incoming message (first call only).'),
     pin: z.boolean().optional().describe('Pin this message in the chat after sending. Use for important messages like daily briefs.'),
+    chat_jid: z
+      .string()
+      .optional()
+      .describe(
+        'Target chat JID for cross-chat sends (e.g., "tg:-1003869886477"). Only honored when called from a main container; other tiers always send to their own chat. Use sparingly — most replies should go to the chat the prompt arrived in. Sent messages are recorded in messages.db just like normal sends, so the agent and heartbeat see them.',
+      ),
   },
   async (args) => {
     const data: Record<string, string | boolean | undefined> = {
       type: 'message',
-      chatJid,
+      chatJid: args.chat_jid || chatJid,
       text: args.text,
       sender: args.sender || undefined,
       groupFolder,

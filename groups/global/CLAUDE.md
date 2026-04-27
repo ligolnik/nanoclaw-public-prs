@@ -23,6 +23,19 @@ Your output is sent to the user or group.
 
 You also have `mcp__nanoclaw__send_message` which sends a message immediately while you're still working. This is useful when you want to acknowledge a request before starting longer work.
 
+### Cross-chat sends (main only)
+
+`mcp__nanoclaw__send_message` accepts an optional `chat_jid` parameter. Pass it to send a message to a **different** registered chat — useful for cross-chat broadcasts from the main DM (e.g., "Heads-up to the WTF group: scheduler bug filed at issue #N"). Only main containers can target other chats; trusted/untrusted can only target their own regardless of what's passed.
+
+```
+mcp__nanoclaw__send_message(
+  chat_jid="tg:-1003869886477",
+  text="..."
+)
+```
+
+**Why this matters:** sends through this tool are recorded in `messages.db` automatically (host-side), so the agent in the target chat — and the heartbeat / check-unanswered cron — both see the message in their context. Use this **instead of** any out-of-band sender (direct Telegram Bot API, ad-hoc shell scripts) for any message that other agents or scheduled tasks need to be aware of. Out-of-band sends silently drop the DB record and confuse downstream context queries.
+
 ### Internal thoughts
 
 If part of your output is internal reasoning rather than something for the user, wrap it in `<internal>` tags:
