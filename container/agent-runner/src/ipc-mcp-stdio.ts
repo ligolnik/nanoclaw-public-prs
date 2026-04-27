@@ -169,6 +169,32 @@ server.tool(
 );
 
 server.tool(
+  'send_voice',
+  'Send a voice (audio) reply to the user via Telegram. Synthesizes the text using OpenAI TTS and uploads as a Telegram voice note. Use when the user sent a voice message and would prefer voice back, or when explicitly asked to reply by voice. Keep text under ~500 chars — TTS is cheap but very long messages feel awkward as audio. Use plain prose without HTML tags or markdown.',
+  {
+    text: z.string().describe('The text to speak (plain prose, no HTML/markdown).'),
+    voice: z
+      .enum(['alloy', 'echo', 'fable', 'onyx', 'nova', 'shimmer'])
+      .optional()
+      .describe('OpenAI TTS voice (default: alloy).'),
+    reply_to: z.string().optional().describe('Message ID to reply to.'),
+  },
+  async (args) => {
+    const data: Record<string, string | undefined> = {
+      type: 'send_voice',
+      chatJid,
+      text: args.text,
+      voice: args.voice || 'alloy',
+      replyToMessageId: args.reply_to,
+      groupFolder,
+      timestamp: new Date().toISOString(),
+    };
+    writeIpcFile(MESSAGES_DIR, data);
+    return { content: [{ type: 'text' as const, text: 'Voice queued for sending.' }] };
+  },
+);
+
+server.tool(
   'react_to_message',
   'React to a message with an emoji. Use to acknowledge, approve, or express sentiment without sending a full text reply. Invalid emoji falls back to 👍.',
   {

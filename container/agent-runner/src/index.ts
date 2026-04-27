@@ -14,6 +14,7 @@
  *   Final marker after loop ends signals completion.
  */
 
+import crypto from 'crypto';
 import fs from 'fs';
 import path from 'path';
 import { execFile } from 'child_process';
@@ -23,6 +24,10 @@ import {
   PreCompactHookInput,
 } from '@anthropic-ai/claude-agent-sdk';
 import { fileURLToPath } from 'url';
+
+// ESM replacement for CommonJS __dirname. Must be defined at module scope so
+// it's available everywhere (runQuery and main() both reference it).
+const __dirname = path.dirname(fileURLToPath(import.meta.url));
 
 interface ContainerInput {
   prompt: string;
@@ -76,7 +81,16 @@ interface SDKUserMessage {
   session_id: string;
 }
 
-const IPC_INPUT_DIR = '/workspace/ipc/input';
+// Prefer the session-scoped input dir when it's populated. On Docker Desktop
+// for macOS, nested bind mounts don't reliably overlay (the orchestrator binds
+// <ipc>/input-<session>/ onto <ipc>/input/ but VirtioFS leaves <ipc>/input/
+// empty while the real messages land at <ipc>/input-<session>/). Falling back
+// to /workspace/ipc/input keeps Linux / correctly-overlaid mounts working.
+const SESSION_NAME = process.env.NANOCLAW_SESSION_NAME || 'default';
+const IPC_SESSION_INPUT_DIR = `/workspace/ipc/input-${SESSION_NAME}`;
+const IPC_INPUT_DIR = fs.existsSync(IPC_SESSION_INPUT_DIR)
+  ? IPC_SESSION_INPUT_DIR
+  : '/workspace/ipc/input';
 const IPC_INPUT_CLOSE_SENTINEL = path.join(IPC_INPUT_DIR, '_close');
 const IPC_POLL_MS = 500;
 
@@ -372,7 +386,7 @@ function drainIpcInput(): string[] {
         const data = JSON.parse(fs.readFileSync(filePath, 'utf-8'));
         consumedInputFiles.add(file);
         try { fs.unlinkSync(filePath); } catch (e: any) {
-          if (e.code !== 'EROFS' && e.code !== 'EACCES') throw e;
+          if (e.code !== 'EROFS' && e.code !== 'EACCES' && e.code !== 'ENOENT') throw e;
         }
         if (data.type === 'message' && data.text) {
           messages.push(data.text);
@@ -440,9 +454,21 @@ async function runQuery(
   newSessionId?: string;
   lastAssistantUuid?: string;
   closedDuringQuery: boolean;
+  erroredWithoutProgress: boolean;
 }> {
   const stream = new MessageStream();
   stream.push(prompt);
+
+  // Query-scoped debug state
+  const queryStartTime = Date.now();
+  const toolStartTimes = new Map<string, number>();
+  let totalCacheRead = 0;
+  let totalCacheCreation = 0;
+  let totalInputTokens = 0;
+  let totalOutputTokens = 0;
+  log(
+    `Query input: ${prompt.length} chars, preview="${prompt.replace(/\s+/g, ' ').slice(0, 400)}"`,
+  );
 
   // Poll IPC for follow-up messages and _close sentinel during the query
   let ipcPolling = true;
@@ -469,6 +495,18 @@ async function runQuery(
   let lastAssistantUuid: string | undefined;
   let messageCount = 0;
   let resultCount = 0;
+  // Track the latest-seen assistant turn (updates as streaming chunks arrive)
+  // and the one before it. At result-time, we choose the right resume point:
+  // if the latest is thinking-only + end_turn (a "model decided to say
+  // nothing" pseudo-turn that the API can't resume from), we fall back to
+  // the previous substantive turn.
+  interface AssistantMeta {
+    uuid: string;
+    stopReason?: string;
+    blockTypes: string[];
+  }
+  let currentAssistant: AssistantMeta | undefined;
+  let previousAssistant: AssistantMeta | undefined;
 
   // Streaming preview: accumulate assistant text and emit throttled
   let streamingTextAccum = '';
@@ -492,6 +530,16 @@ async function runQuery(
   }
   const systemPromptAppend =
     appendParts.length > 0 ? appendParts.join('\n\n---\n\n') : undefined;
+  if (systemPromptAppend) {
+    const hash = crypto
+      .createHash('sha256')
+      .update(systemPromptAppend)
+      .digest('hex')
+      .slice(0, 8);
+    log(
+      `systemPromptAppend: ${systemPromptAppend.length} chars, sha=${hash}`,
+    );
+  }
 
   // Rules are loaded by the SDK via the tessl chain: CLAUDE.md → AGENTS.md → .tessl/RULES.md
   // For untrusted groups, the orchestrator copies .tessl from a main group's session.
@@ -548,13 +596,23 @@ async function runQuery(
           : {}),
       },
     },
-    ...(process.env.COMPOSIO_API_KEY
+    // Composio removed — this deployment uses OneCLI for third-party app auth.
+    // See the `onecli` MCP block below.
+    // OneCLI MCP — structured tools (gcal_*, gmail_*, ...) that route through
+    // the OneCLI gateway for transparent OAuth injection. Only register when
+    // HTTPS_PROXY is set, which container-runner.ts does for main + trusted.
+    ...(process.env.HTTPS_PROXY
       ? {
-          composio: {
-            type: 'http' as const,
-            url: 'https://connect.composio.dev/mcp',
-            headers: {
-              'x-consumer-api-key': process.env.COMPOSIO_API_KEY,
+          onecli: {
+            command: 'node',
+            args: [path.join(__dirname, 'onecli-mcp-stdio.js')],
+            env: {
+              HTTPS_PROXY: process.env.HTTPS_PROXY,
+              HTTP_PROXY: process.env.HTTP_PROXY || '',
+              NO_PROXY: process.env.NO_PROXY || '',
+              NODE_USE_ENV_PROXY: '1',
+              NODE_EXTRA_CA_CERTS: process.env.NODE_EXTRA_CA_CERTS || '',
+              SSL_CERT_FILE: process.env.SSL_CERT_FILE || '',
             },
           },
         }
@@ -722,10 +780,58 @@ async function runQuery(
     log(`[msg #${messageCount}] type=${msgType}`);
 
     if (message.type === 'assistant' && 'uuid' in message) {
-      lastAssistantUuid = (message as { uuid: string }).uuid;
-      // Extract text content for streaming preview
-      const content = (message as { message?: { content?: Array<{ type: string; text?: string }> } }).message?.content;
+      const uuid = (message as { uuid: string }).uuid;
+      const msg = (message as { message?: { id?: string; stop_reason?: string; stop_sequence?: string | null; content?: Array<{ type: string; text?: string; thinking?: string; name?: string; input?: unknown; id?: string; signature?: string; data?: unknown }>; usage?: { input_tokens?: number; output_tokens?: number; cache_read_input_tokens?: number; cache_creation_input_tokens?: number } } }).message;
+      const content = msg?.content;
+      // Track the latest assistant message's shape. We finalize the
+      // promotion decision at result-time (see after the loop) because
+      // stop_reason arrives late in streaming — the first chunk of an
+      // assistant message usually has stop_reason=undefined, which
+      // defeated the earlier per-chunk check.
+      if (currentAssistant && currentAssistant.uuid !== uuid) {
+        // This is a new assistant turn — the one we were tracking is now
+        // "previous" (and was substantive enough to warrant keeping).
+        previousAssistant = currentAssistant;
+      }
+      currentAssistant = {
+        uuid,
+        stopReason: msg?.stop_reason,
+        blockTypes: Array.isArray(content)
+          ? content.map((c) => c.type)
+          : [],
+      };
       if (content) {
+        const blockTypes = content.map((c) => c.type).join(',');
+        const stopR = msg?.stop_reason ? ` stop=${msg.stop_reason}` : '';
+        const apiId = msg?.id ? ` api_id=${msg.id}` : '';
+        log(
+          `[msg #${messageCount}] assistant blocks=[${blockTypes}]${stopR}${apiId}`,
+        );
+        for (const block of content) {
+          if (block.type === 'thinking' && block.thinking) {
+            log(`[msg #${messageCount}] thinking="${block.thinking.replace(/\s+/g, ' ').slice(0, 400)}"`);
+          } else if (block.type === 'redacted_thinking') {
+            log(`[msg #${messageCount}] redacted_thinking (encrypted)`);
+          } else if (block.type === 'text' && block.text) {
+            log(`[msg #${messageCount}] text="${block.text.replace(/\s+/g, ' ').slice(0, 400)}"`);
+          } else if (block.type === 'tool_use') {
+            const inputStr = JSON.stringify(block.input ?? {}).slice(0, 400);
+            log(`[msg #${messageCount}] tool_use=${block.name} id=${block.id} input=${inputStr}`);
+            if (block.id) toolStartTimes.set(block.id, Date.now());
+          } else {
+            log(`[msg #${messageCount}] block type=${block.type} ${JSON.stringify(block).slice(0, 200)}`);
+          }
+        }
+        if (msg?.usage) {
+          const u = msg.usage;
+          totalInputTokens += u.input_tokens ?? 0;
+          totalOutputTokens += u.output_tokens ?? 0;
+          totalCacheRead += u.cache_read_input_tokens ?? 0;
+          totalCacheCreation += u.cache_creation_input_tokens ?? 0;
+          log(
+            `[msg #${messageCount}] usage in=${u.input_tokens ?? '?'} out=${u.output_tokens ?? '?'} cache_r=${u.cache_read_input_tokens ?? 0} cache_c=${u.cache_creation_input_tokens ?? 0}`,
+          );
+        }
         const text = content
           .filter((c) => c.type === 'text' && c.text)
           .map((c) => c.text!)
@@ -739,6 +845,49 @@ async function runQuery(
           }
         }
       }
+    }
+
+    if (message.type === 'user') {
+      const content = (message as { message?: { content?: Array<{ type: string; tool_use_id?: string; content?: unknown; is_error?: boolean }> } }).message?.content;
+      if (Array.isArray(content)) {
+        for (const block of content) {
+          if (block.type === 'tool_result') {
+            const preview =
+              typeof block.content === 'string'
+                ? block.content
+                : JSON.stringify(block.content ?? '');
+            const status = block.is_error ? 'error' : 'ok';
+            const startedAt = block.tool_use_id
+              ? toolStartTimes.get(block.tool_use_id)
+              : undefined;
+            const latencyMs = startedAt ? Date.now() - startedAt : undefined;
+            if (startedAt && block.tool_use_id)
+              toolStartTimes.delete(block.tool_use_id);
+            const latencyStr =
+              latencyMs !== undefined ? ` latency=${latencyMs}ms` : '';
+            // Full content for errors (uncapped), 400-char preview otherwise.
+            const body = block.is_error
+              ? preview
+              : preview.replace(/\s+/g, ' ').slice(0, 400);
+            log(
+              `[msg #${messageCount}] tool_result id=${block.tool_use_id} ${status}${latencyStr} preview="${body}"`,
+            );
+          }
+        }
+      }
+    }
+
+    if (
+      message.type === 'system' &&
+      (message as { subtype?: string }).subtype === 'rate_limit_event'
+    ) {
+      log(
+        `[msg #${messageCount}] rate_limit_event ${JSON.stringify(message).slice(0, 500)}`,
+      );
+    } else if ((message as { type?: string }).type === 'rate_limit_event') {
+      log(
+        `[msg #${messageCount}] rate_limit_event ${JSON.stringify(message).slice(0, 500)}`,
+      );
     }
 
     if (message.type === 'system' && message.subtype === 'init') {
@@ -782,10 +931,48 @@ async function runQuery(
   }
 
   ipcPolling = false;
+
+  // Now that the turn has fully landed, finalize the resume point. If the
+  // latest assistant turn was thinking-only + end_turn (a pseudo-turn the
+  // API can't continue from), fall back to the previous substantive turn.
+  if (currentAssistant) {
+    const isThinkingOnlyEndTurn =
+      currentAssistant.stopReason === 'end_turn' &&
+      currentAssistant.blockTypes.length > 0 &&
+      currentAssistant.blockTypes.every(
+        (t) => t === 'thinking' || t === 'redacted_thinking',
+      );
+    if (isThinkingOnlyEndTurn) {
+      log(
+        `Skipping promotion of thinking-only end_turn turn (uuid=${currentAssistant.uuid}) — using previous ${previousAssistant?.uuid || 'none'} as resume point`,
+      );
+      lastAssistantUuid = previousAssistant?.uuid;
+    } else {
+      lastAssistantUuid = currentAssistant.uuid;
+    }
+  }
+
+  const elapsedMs = Date.now() - queryStartTime;
+  const totalCacheInput = totalCacheRead + totalCacheCreation;
+  const hitRate =
+    totalCacheInput > 0
+      ? ((totalCacheRead / totalCacheInput) * 100).toFixed(1)
+      : 'n/a';
+  // Detect the failure mode where the SDK returned an error without making
+  // any progress (zero tokens, no new assistant uuid). The outer loop uses
+  // this to clear resumeAt before retrying, avoiding an infinite loop on a
+  // bad resume point.
+  const erroredWithoutProgress =
+    !lastAssistantUuid && totalOutputTokens === 0 && messageCount <= 2;
   log(
-    `Query done. Messages: ${messageCount}, results: ${resultCount}, lastAssistantUuid: ${lastAssistantUuid || 'none'}, closedDuringQuery: ${closedDuringQuery}`,
+    `Query done. Messages: ${messageCount}, results: ${resultCount}, lastAssistantUuid: ${lastAssistantUuid || 'none'}, closedDuringQuery: ${closedDuringQuery}, erroredWithoutProgress: ${erroredWithoutProgress}, wall=${elapsedMs}ms, tokens_in=${totalInputTokens}, tokens_out=${totalOutputTokens}, cache_read=${totalCacheRead}, cache_create=${totalCacheCreation}, cache_hit_rate=${hitRate}%`,
   );
-  return { newSessionId, lastAssistantUuid, closedDuringQuery };
+  return {
+    newSessionId,
+    lastAssistantUuid,
+    closedDuringQuery,
+    erroredWithoutProgress,
+  };
 }
 
 interface ScriptResult {
@@ -872,7 +1059,6 @@ async function main(): Promise<void> {
     CLAUDE_CODE_AUTO_COMPACT_WINDOW: '165000',
   };
 
-  const __dirname = path.dirname(fileURLToPath(import.meta.url));
   const mcpServerPath = path.join(__dirname, 'ipc-mcp-stdio.js');
 
   let sessionId = containerInput.sessionId;
@@ -1027,6 +1213,10 @@ async function main(): Promise<void> {
 
   // Query loop: run query → wait for IPC message → run new query → repeat
   let resumeAt: string | undefined;
+  // Per-turn flag: set true when we auto-retry after an error_during_execution,
+  // reset when the next query succeeds. Prevents infinite retry loops if the
+  // failure isn't resume-related (e.g. persistent API outage).
+  let recoveredThisTurn = false;
   try {
     while (true) {
       log(
@@ -1060,6 +1250,20 @@ async function main(): Promise<void> {
       if (queryResult.lastAssistantUuid) {
         resumeAt = queryResult.lastAssistantUuid;
       }
+      // Recovery: the SDK errored without making any progress (no new
+      // assistant uuid, no tokens) — almost always means the current
+      // resumeAt points at a turn the API can't continue from. Clear it
+      // and IMMEDIATELY retry with the same prompt so the user's message
+      // isn't silently dropped. Cap at one retry per turn to guarantee
+      // forward progress even if the failure isn't resume-related.
+      if (queryResult.erroredWithoutProgress && resumeAt && !recoveredThisTurn) {
+        log(
+          `Recovery: error_during_execution with no progress, clearing resumeAt=${resumeAt} and retrying the same prompt`,
+        );
+        resumeAt = undefined;
+        recoveredThisTurn = true;
+        continue; // skip the IPC wait — retry the same query immediately
+      }
 
       // If _close was consumed during the query, exit immediately.
       // Don't emit a session-update marker (it would reset the host's
@@ -1083,6 +1287,7 @@ async function main(): Promise<void> {
 
       log(`Got new message (${nextMessage.length} chars), starting new query`);
       prompt = nextMessage;
+      recoveredThisTurn = false; // new turn → reset retry budget
     }
   } catch (err) {
     const errorMessage = err instanceof Error ? err.message : String(err);
