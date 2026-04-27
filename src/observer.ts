@@ -197,7 +197,8 @@ function send(text: string): void {
   // logged but does not abort the rest — partial visibility beats none.
   let chain: Promise<unknown> = Promise.resolve();
   parts.forEach((part, idx) => {
-    const body = parts.length > 1 ? `${part} (${idx + 1}/${parts.length})` : part;
+    const body =
+      parts.length > 1 ? `${part} (${idx + 1}/${parts.length})` : part;
     chain = chain.then(() =>
       channel.sendMessage(OBSERVER_CHAT_JID, body).catch((err: unknown) => {
         logger.warn(
