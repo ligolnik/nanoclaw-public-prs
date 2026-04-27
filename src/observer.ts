@@ -226,7 +226,23 @@ export function onAgentLine(source: string, raw: string): void {
     // A new query is starting — the 👀 reaction from telegram.ts is already
     // on the message. Don't pre-emptively change it; the first thinking/tool
     // event will swap to 🤔/🔧 naturally.
-    startWatchdog(source);
+    //
+    // Don't arm the watchdog for scheduled tasks. Cron-driven queries
+    // (SmartThings refresh, check-unanswered, heartbeat, etc.) run in
+    // maintenance containers but share the source folder with the user's
+    // default container. Without this gate, a long cron task crossing 120s
+    // fires "Still working — 120s in" into the user's chat — looking like
+    // the user's last message is still being processed when actually the
+    // user's query finished minutes ago and a separate cron is running.
+    // The agent-runner logs scheduled tasks with a `[SCHEDULED TASK -` or
+    // `<untrusted-input source=…> [SCHEDULED TASK -` prefix in the
+    // preview; match either form.
+    const isScheduledTask = /preview="(?:<untrusted-input source="[^"]*">\s*)?\[SCHEDULED TASK/.test(
+      line,
+    );
+    if (!isScheduledTask) {
+      startWatchdog(source);
+    }
     return;
   }
 
