@@ -652,12 +652,14 @@ export class TelegramChannel implements Channel {
       // setMessageReaction is single-emoji per bot per message, so each
       // update replaces the prior one.
       //
-      // Gating: only react when the message will actually be routed to
-      // the agent. For main and trigger-not-required chats that's every
-      // message; for trigger-required groups the message must contain the
-      // trigger (or be a reply to a bot message — same logic as in the
-      // routing path in src/index.ts). Otherwise we'd ack messages that
-      // weren't directed at the bot, confusing the chat.
+      // Gating: the host knows a message arrived but has no context on
+      // the sender. In untrusted chats the agent's bad-actor-disengage
+      // rule may decide to go silent (no text, no reaction) — host-side
+      // auto-react would leak a "I see you" signal before that rule ever
+      // ran. So we only auto-react in trust contexts where engagement is
+      // already guaranteed: main and trusted groups where the trigger
+      // matched. For untrusted, the agent itself decides whether to
+      // react (after reading the message and applying its rules).
       const requiresTrigger = group.requiresTrigger !== false && !group.isMain;
       const triggerHit =
         !requiresTrigger ||
