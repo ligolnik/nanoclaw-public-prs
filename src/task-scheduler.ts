@@ -14,6 +14,7 @@ import {
   getDueTasks,
   getTaskById,
   logTaskRun,
+  pruneCompletedTasks,
   setSession,
   updateTask,
   updateTaskAfterRun,
@@ -63,6 +64,15 @@ export function computeNextRun(task: ScheduledTask): string | null {
 
   return null;
 }
+
+/**
+ * How long a completed once-task lingers in scheduled_tasks before the
+ * scheduler loop prunes it. Cancellations remove rows immediately via
+ * deleteTask; this only governs the natural-completion path. 24h is long
+ * enough that a user can still find a recently-completed task in
+ * list_tasks output, short enough that it doesn't grow without bound.
+ */
+export const COMPLETED_TASK_TTL_MS = 24 * 60 * 60 * 1000;
 
 export interface SchedulerDependencies {
   registeredGroups: () => Record<string, RegisteredGroup>;
@@ -318,6 +328,11 @@ export function startSchedulerLoop(deps: SchedulerDependencies): void {
 
   const loop = async () => {
     try {
+      const pruned = pruneCompletedTasks(COMPLETED_TASK_TTL_MS);
+      if (pruned > 0) {
+        logger.info({ count: pruned }, 'Pruned completed once-tasks');
+      }
+
       const dueTasks = getDueTasks();
       if (dueTasks.length > 0) {
         logger.info({ count: dueTasks.length }, 'Found due tasks');
