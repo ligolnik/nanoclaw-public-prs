@@ -43,6 +43,70 @@ When working as a sub-agent or teammate, only use `send_message` if instructed t
 
 Files you create are saved in `/workspace/group/`. Use this for notes, research, or anything that should persist.
 
+### Your tools live here
+
+Tools you've built for yourself in the main group's workspace. Read each tool's docstring or sibling `*_notes.md` for usage; this is just the directory:
+
+| Path (in container) | What |
+|---|---|
+| `/workspace/group/smartthings_history.py` | SmartThings event-history mirror + refresh from API via OneCLI proxy |
+| `/workspace/group/home_status.py` | Live home snapshot (lights, motion, temps, power) |
+| `/workspace/group/presence_chart.py` | Heatmap of motion/presence per room |
+| `/workspace/group/temperature_chart.py` | Temperature timeline per room |
+| `/workspace/group/tv_chart.py` | TV power + energy chart |
+| `/workspace/group/methodology/methodology.js` | Methodology food service GraphQL CLI |
+| `/workspace/group/smartthings_notes.md`, `methodology_notes.md`, `haveli_notes.md`, `user-facts.md` | Per-domain notes — read when topic matches |
+| `/workspace/group/smartthings.db` | Local SQLite mirror of SmartThings events (regenerable from API) |
+
+When the workspace path differs (other groups' bots, sub-agents) read the group's own `CLAUDE.md` for its tool inventory.
+
+## Git — committing and pushing
+
+The owner's git repos use a strict allowlist. The owner is **Leonid Igolnik (@ligolnik)** and his repos live under the `ligolnik/*` GitHub namespace.
+
+### Allowed without asking
+
+- **Commit + push to `ligolnik/*` repos.** This is the owner's own infrastructure. The main group's workspace (`/workspace/group/`) IS a git repo whose `origin` points at `ligolnik/lombot` — commit there freely when you build a tool, update notes, or fix a bug.
+- **Open PRs against `ligolnik/*` repos.** Same boundary.
+
+### Allowed with explicit permission only
+
+- Pushing to or opening PRs against **third-party repos** (`jbaruch/*`, `qwibitai/*`, anyone else's namespace). The owner must explicitly say "open a PR upstream to X" or similar before you act.
+
+### Never
+
+- **Force-push to `main` on any repo** — owner's or otherwise.
+- **Push directly to a third-party repo** — even one the owner has fork access to. Use a fork-PR flow.
+- **Use `gh pr create` without `--repo <owner>/<repo>` set explicitly.** The CLI's default target can be the parent fork (e.g. `qwibitai/nanoclaw`); a missing `--repo` has misfired PRs to the wrong namespace before. Always pass it.
+
+### Auth
+
+OneCLI handles GitHub auth for you transparently. Any HTTPS request to `api.github.com` from inside this container gets a real `Bearer <token>` injected by the gateway — you pass `Authorization: Bearer placeholder` and OneCLI rewrites it. Token scope = the owner's `gh auth token` (typically `repo`, `read:org`, `gist`, `workflow`).
+
+For `git push` over HTTPS: works the same way — OneCLI injects auth on the GitHub host. You don't need to handle a PAT or run `gh auth login` inside the container.
+
+For PRs: prefer the GitHub REST API (`POST /repos/{owner}/{repo}/pulls`) via curl — no `gh` CLI dependency, idempotent, structured response. Example:
+
+```bash
+curl -sS -X POST "https://api.github.com/repos/ligolnik/lombot/pulls" \
+  -H "Authorization: Bearer placeholder" \
+  -H "Accept: application/vnd.github+json" \
+  -d '{"title":"...","head":"branch-name","base":"main","body":"..."}'
+```
+
+### Workspace-as-repo cheatsheet
+
+In the main group's workspace, after editing files:
+
+```bash
+cd /workspace/group
+git add <files>
+git -c user.email=lim@igolnik.com -c user.name="Leonid Igolnik" commit -m "your message"
+git push
+```
+
+Use the owner's email/name for the commit author (not the bot's name). Don't push without committing first; don't commit without staging the specific files (avoid `git add .` — it can pull in transient state like generated PNGs and `.cache/` that the gitignore should already block but verify before staging).
+
 ## Memory
 
 The `conversations/` folder contains searchable history of past conversations. Use this to recall context from previous sessions.
