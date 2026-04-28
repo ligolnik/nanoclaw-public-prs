@@ -900,7 +900,10 @@ async function main(): Promise<void> {
   // Observer: if OBSERVER_CHAT_JID is set, container-runner's stderr
   // parser will forward per-query summaries + live error alerts there.
   // Also drives progress reactions on user messages (👀 → 🤔 → 🔧 → ✍).
-  initObserver(channels, () => registeredGroups);
+  // Awaited so the privacy-gate verification (refuse to enable if the
+  // configured chat is a multi-participant group) finishes before we
+  // start spawning queries that would feed the observer.
+  await initObserver(channels, () => registeredGroups);
 
   // Main group bypasses the concurrency cap so user-facing replies are
   // never queued behind background heartbeats or other groups.
