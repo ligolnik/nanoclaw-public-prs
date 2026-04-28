@@ -219,11 +219,19 @@ function startWatchdog(source: string): void {
       const nextThreshold = PING_AT_SECONDS[w.pingsSent];
       if (nextThreshold && elapsedSec >= nextThreshold) {
         w.pingsSent++;
+        // Delivery gate: if the agent has already sent a substantive
+        // send_message reply this turn, suppress the threshold ping.
+        // Post-delivery tool calls (memory writes, reads, compaction)
+        // are housekeeping — the user has already seen the answer and
+        // a "Still working" ping at this point is pure noise. Reaction
+        // blinking above continues (benign — it's on the user's own
+        // message). Fixes lombot#16.
+        const stateForPing = states.get(source);
+        if (stateForPing?.sentReply) return;
         const chatJid = folderToChatJid(source);
         // Same per-state target as updateReaction — pin the ping
         // to the message this query is actually processing, not
         // whatever's the latest inbound.
-        const stateForPing = states.get(source);
         const msgId =
           stateForPing?.targetMessageId ??
           (chatJid ? latestUserMessage.get(chatJid) : undefined);
@@ -231,8 +239,7 @@ function startWatchdog(source: string): void {
         const isMainChat = chatJid && groups?.[chatJid]?.isMain === true;
         if (chatJid && msgId && isMainChat) {
           const ch = chatChannel(chatJid);
-          const state = states.get(source);
-          const toolCount = state?.toolCalls.length ?? 0;
+          const toolCount = stateForPing?.toolCalls.length ?? 0;
           const text = `<i>Still working — ${elapsedSec}s in${toolCount ? `, ${toolCount} tools so far` : ''}.</i>`;
           ch?.sendMessage(chatJid, text, msgId).catch((err) =>
             logger.debug({ err }, 'Watchdog ping failed'),
@@ -308,6 +315,15 @@ interface QueryState {
   // Once committed, every state transition through the rest of the
   // turn fires reactions normally.
   committed: boolean;
+  // Delivery gate: set to true the first time mcp__nanoclaw__send_message
+  // fires. Once the agent has delivered its substantive reply, threshold
+  // pings ("Still working — Xs in") are suppressed — post-delivery tool
+  // calls (memory writes, reads, compaction) are housekeeping and the
+  // user has already seen the answer. Reaction blinking keeps working
+  // (benign: it's on the user's own message). Resets to false on each
+  // new Query input so multi-exchange turns gate correctly.
+  // Fixes lombot#16.
+  sentReply: boolean;
   // The message ID this query is processing, parsed from the
   // `<message id="N">` tag in the Query input prompt. Reactions
   // fire on THIS message, not on the most-recent inbound — a fast-
@@ -329,6 +345,7 @@ function newState(): QueryState {
     toolErrors: 0,
     textSnippets: [],
     committed: false,
+    sentReply: false,
   };
 }
 
@@ -483,11 +500,17 @@ export function onAgentLine(source: string, raw: string): void {
     // mcp__nanoclaw__send_message means the agent is DELIVERING, not doing
     // more work — show the "composing" emoji instead of the "working"
     // emoji so the user sees progress: thinking → working → composing.
+    // Also set sentReply so the watchdog suppresses threshold pings from
+    // this point on (post-delivery housekeeping should not produce a
+    // "Still working" message after the user has already seen the answer).
     //
     // IMPORTANT: these must all be in TELEGRAM_ALLOWED_REACTIONS in
     // src/channels/telegram.ts. Telegram limits bot reactions to a fixed
     // set; anything else silently falls back to 👍 and defeats the signal.
     // ⚡ is the closest "busy/working" emoji in the allowed set.
+    if (toolUse[1] === 'mcp__nanoclaw__send_message') {
+      state.sentReply = true;
+    }
     updateReaction(
       source,
       toolUse[1] === 'mcp__nanoclaw__send_message' ? '✍' : '⚡',
