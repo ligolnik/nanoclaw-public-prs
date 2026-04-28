@@ -49,6 +49,12 @@ export interface IpcDeps {
     caption?: string,
     replyToMessageId?: string,
   ) => Promise<void>;
+  sendVoice?: (
+    jid: string,
+    text: string,
+    voice: string,
+    replyToMessageId?: string,
+  ) => Promise<void>;
   registeredGroups: () => Record<string, RegisteredGroup>;
   registerGroup: (jid: string, group: RegisteredGroup) => void;
   syncGroups: (force: boolean) => Promise<void>;
@@ -339,6 +345,54 @@ export function startIpcWatcher(deps: IpcDeps): void {
                       { hostPath, containerPath, sourceGroup },
                       'send_file: file not found on host',
                     );
+                  }
+                }
+              } else if (
+                data.type === 'send_voice' &&
+                data.chatJid &&
+                data.text &&
+                deps.sendVoice
+              ) {
+                const targetGroup = registeredGroups[data.chatJid];
+                if (
+                  isMain ||
+                  (targetGroup && targetGroup.folder === sourceGroup)
+                ) {
+                  // Strip <internal> tags from text — voice can't render
+                  // them and they shouldn't end up in db accounting either.
+                  const cleanText = stripInternalTags(data.text || '');
+                  if (cleanText) {
+                    try {
+                      await deps.sendVoice(
+                        data.chatJid,
+                        cleanText,
+                        (data.voice as string) || 'alloy',
+                        data.replyToMessageId,
+                      );
+                      // Store the spoken text in the DB so heartbeat /
+                      // unanswered-checks see this as a real reply (same
+                      // accounting as send_file caption + send_message).
+                      storeMessage({
+                        id: `bot-${Date.now()}-${Math.random().toString(36).slice(2, 7)}`,
+                        chat_jid: data.chatJid,
+                        sender: ASSISTANT_NAME,
+                        sender_name: ASSISTANT_NAME,
+                        content: cleanText,
+                        timestamp: new Date().toISOString(),
+                        is_from_me: true,
+                        is_bot_message: true,
+                        reply_to_message_id: data.replyToMessageId,
+                      });
+                      logger.info(
+                        { chatJid: data.chatJid, chars: cleanText.length, sourceGroup },
+                        'IPC voice sent',
+                      );
+                    } catch (err) {
+                      logger.error(
+                        { chatJid: data.chatJid, err },
+                        'IPC send_voice failed',
+                      );
+                    }
                   }
                 }
               } else if (data.type === 'message' && data.chatJid && data.text) {

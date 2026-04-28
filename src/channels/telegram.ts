@@ -1,5 +1,6 @@
 import fs from 'fs';
 import https from 'https';
+import os from 'os';
 import path from 'path';
 import { Api, Bot, InputFile } from 'grammy';
 import OpenAI from 'openai';
@@ -1260,6 +1261,69 @@ export class TelegramChannel implements Channel {
       logger.info({ jid, messageId }, 'Telegram message pinned');
     } catch (err) {
       logger.error({ jid, messageId, err }, 'Failed to pin Telegram message');
+    }
+  }
+
+  /**
+   * Synthesize text → speech via the OpenAI TTS endpoint, then upload
+   * to Telegram as a voice note. Audio is OGG/Opus, the Telegram-native
+   * format for voice — Telegram displays it as a real voice message
+   * (waveform + scrubber + play speed), not a generic audio attachment.
+   *
+   * Pairs with the existing voice-in path (`transcribeVoice` above):
+   * voice messages from the user transcribe into the agent's prompt;
+   * the agent can reply in kind via the `send_voice` MCP tool, which
+   * lands here through the IPC layer.
+   *
+   * Gates on OPENAI_API_KEY — same env var transcribeVoice already
+   * uses. If unset, the call fails loudly so the operator sees the
+   * misconfiguration rather than silently dropping audio.
+   */
+  async sendVoice(
+    jid: string,
+    text: string,
+    voice: string,
+    replyToMessageId?: string,
+  ): Promise<void> {
+    if (!this.bot) return;
+    const envVars = readEnvFile(['OPENAI_API_KEY']);
+    const apiKey = process.env.OPENAI_API_KEY || envVars.OPENAI_API_KEY;
+    if (!apiKey) {
+      throw new Error('OPENAI_API_KEY not set — cannot synthesize voice');
+    }
+    const tmpFile = path.join(os.tmpdir(), `tts-${Date.now()}.ogg`);
+    try {
+      const openai = new OpenAI({ apiKey });
+      // response_format=opus produces the codec Telegram expects in a
+      // .ogg container, so the file uploads as a voice message rather
+      // than a generic audio attachment.
+      const speech = await openai.audio.speech.create({
+        model: 'tts-1',
+        voice: voice as 'alloy' | 'echo' | 'fable' | 'onyx' | 'nova' | 'shimmer',
+        input: text,
+        response_format: 'opus',
+      });
+      const buffer = Buffer.from(await speech.arrayBuffer());
+      fs.writeFileSync(tmpFile, buffer);
+      if (fs.statSync(tmpFile).size === 0) {
+        throw new Error('TTS produced no audio');
+      }
+      const numericId = jid.replace(/^tg:/, '');
+      const opts: { reply_parameters?: { message_id: number } } = {};
+      if (replyToMessageId) {
+        opts.reply_parameters = { message_id: parseInt(replyToMessageId, 10) };
+      }
+      await this.bot.api.sendVoice(numericId, new InputFile(tmpFile), opts);
+      logger.info({ jid, chars: text.length, voice }, 'Telegram voice sent');
+    } catch (err) {
+      logger.error({ jid, err }, 'Failed to send Telegram voice');
+      throw err;
+    } finally {
+      try {
+        fs.unlinkSync(tmpFile);
+      } catch {
+        /* ignore */
+      }
     }
   }
 

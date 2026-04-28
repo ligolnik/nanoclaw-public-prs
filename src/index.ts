@@ -1073,6 +1073,11 @@ async function main(): Promise<void> {
       if (!channel) return;
       await channel.sendFile?.(jid, filePath, caption, replyToMessageId);
     },
+    sendVoice: async (jid, text, voice, replyToMessageId) => {
+      const channel = findChannel(channels, jid);
+      if (!channel) return;
+      await channel.sendVoice?.(jid, text, voice, replyToMessageId);
+    },
     registeredGroups: () => registeredGroups,
     registerGroup,
     syncGroups: async (force: boolean) => {

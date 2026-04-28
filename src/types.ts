@@ -126,6 +126,15 @@ export interface Channel {
     caption?: string,
     replyToMessageId?: string,
   ): Promise<void>;
+  // Optional: synthesize text-to-speech and send as a voice note.
+  // Channels that don't support voice attachments leave this
+  // unimplemented; the IPC layer no-ops the `send_voice` tool then.
+  sendVoice?(
+    jid: string,
+    text: string,
+    voice: string,
+    replyToMessageId?: string,
+  ): Promise<void>;
   // Optional: create a draft stream for progressive message display.
   createDraftStream?(
     jid: string,
