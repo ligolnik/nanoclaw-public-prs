@@ -16,9 +16,8 @@ const OBSERVER_CHAT_JID =
 let channelsRef: Channel[] | null = null;
 let registeredGroupsRef: (() => Record<string, RegisteredGroup>) | null = null;
 // Toggled to true only after we've verified the configured JID points
-// at a 1:1 / DM chat (or the operator has opted out of verification).
-// Stays false on misconfiguration so onAgentLine becomes a no-op and
-// no thinking content leaks into a wrong chat.
+// at a 1:1 / DM chat. Stays false on misconfiguration so onAgentLine
+// becomes a no-op and no thinking content leaks into a wrong chat.
 let observerEnabledFlag = false;
 
 export async function initObserver(
@@ -68,20 +67,15 @@ export async function initObserver(
     // partial output from EVERY container, and any member of the
     // observer chat sees that stream. We allow it because some
     // operators run a deliberate "single-user private group" as the
-    // observer (no third parties added — the group exists just to
-    // get a fixed chat ID separate from a 1:1 DM). Loud warn at
-    // startup so the misconfiguration is visible if it happens by
-    // accident.
+    // observer (no third parties added). Loud warn at startup so the
+    // misconfiguration is visible if it happens by accident.
     logger.warn(
       { jid: OBSERVER_CHAT_JID },
       'Observer chat is a group / channel, NOT a 1:1 DM. Anyone in the chat will see all containers reasoning. Use a chat with only the bot + you, or switch OBSERVER_CHAT_JID to a private DM.',
     );
   }
   observerEnabledFlag = true;
-  logger.info(
-    { jid: OBSERVER_CHAT_JID, isPrivate },
-    'Observer chat enabled',
-  );
+  logger.info({ jid: OBSERVER_CHAT_JID, isPrivate }, 'Observer chat enabled');
   armSelfTest();
 }
 
@@ -161,10 +155,10 @@ const PING_AT_SECONDS = [60, 120, 300]; // 1m, 2m, 5m
 // overwrite legitimate tool-fired state mid-query and leave the
 // "tool" emoji stuck on the message after a long watchdog cycle even
 // when the final state should have been ✍ (composed reply) or 🤔
-// (thinking-only). 🫡 / 🆒 are both in TELEGRAM_ALLOWED_REACTIONS
+// (thinking-only). 🫡 / 🤓 are both in TELEGRAM_ALLOWED_REACTIONS
 // (see src/channels/telegram.ts) and read as "still on it" without
 // claiming a particular semantic phase.
-const BLINK_PAIR = ['🫡', '🆒'];
+const BLINK_PAIR = ['🫡', '🤓'];
 // Final reaction set when a query completes. The watchdog blink
 // otherwise leaves whichever blink-emoji happened to be current on
 // the user's message — unrelated to the actual end-state of the
@@ -186,18 +180,36 @@ function startWatchdog(source: string): void {
     lastBlinkEmoji: BLINK_PAIR[0],
     intervalId: setInterval(() => {
       const elapsedSec = Math.floor((Date.now() - startedAt) / 1000);
+      // Engagement gate: don't blink reactions on a message the
+      // agent is silently ignoring. If the turn never commits to
+      // a user-visible action (text / tool_use), no observer
+      // reaction has fired yet — blinking 🫡/🤓 here would light
+      // up the user's chat with bot activity for a message that's
+      // about to receive zero response.
+      if (!states.get(source)?.committed) return;
       // Blink reaction
       const next =
         w.lastBlinkEmoji === BLINK_PAIR[0] ? BLINK_PAIR[1] : BLINK_PAIR[0];
       w.lastBlinkEmoji = next;
       updateReaction(source, next);
-      // Threshold pings — once each
+      // Threshold pings — once each. Restricted to the main chat:
+      // posting "Still working — 60s in" into a shared trusted /
+      // untrusted group is conversational noise for everyone *else*
+      // in the chat (the people who didn't ask the bot anything),
+      // and in untrusted contexts it also leaks "I'm grinding on
+      // your prompt" before the agent's bad-actor-disengage rule
+      // had a say. The blink reaction above stays for ALL chats
+      // (it's just a reaction on the user's own message — no
+      // broadcast surface). Threshold pings broadcast a new
+      // message, so they go only where conversation is owner-only.
       const nextThreshold = PING_AT_SECONDS[w.pingsSent];
       if (nextThreshold && elapsedSec >= nextThreshold) {
         w.pingsSent++;
         const chatJid = folderToChatJid(source);
         const msgId = chatJid ? latestUserMessage.get(chatJid) : undefined;
-        if (chatJid && msgId) {
+        const groups = registeredGroupsRef?.();
+        const isMainChat = chatJid && groups?.[chatJid]?.isMain === true;
+        if (chatJid && msgId && isMainChat) {
           const ch = chatChannel(chatJid);
           const state = states.get(source);
           const toolCount = state?.toolCalls.length ?? 0;
@@ -217,7 +229,12 @@ function stopWatchdog(source: string, reactionOnStop?: string): void {
   if (!w) return;
   clearInterval(w.intervalId);
   watchdogs.delete(source);
-  // Reset the user's chat reaction so a stale 🫡/🆒 blink doesn't
+  // Sentinel: caller passed `'__skip__'` to mean "tear down the
+  // watchdog interval but DO NOT touch the user's reaction." Used
+  // when the turn ended without any agent commitment to engagement
+  // — silent thinking-only turn — so the message stays untouched.
+  if (reactionOnStop === '__skip__') return;
+  // Reset the user's chat reaction so a stale 🫡/🤓 blink doesn't
   // outlive the watchdog. If the caller didn't pick a specific
   // emoji (e.g. mid-flight watchdog teardown to defuse a stale
   // entry), fall back to the deterministic done emoji.
@@ -262,6 +279,15 @@ interface QueryState {
   toolErrors: number;
   textSnippets: string[];
   stopReason?: string;
+  // Engagement gate: stays false until the agent commits to a
+  // user-visible action (text or tool_use). Thinking-only turns
+  // (the agent reading a message and deciding to stay silent) leave
+  // this false, and we suppress all reaction updates / watchdog
+  // pings so the user sees no bot activity on irrelevant messages
+  // in low-trust groups where every message spawns a container.
+  // Once committed, every state transition through the rest of the
+  // turn fires reactions normally.
+  committed: boolean;
 }
 
 // Keyed by container/group folder; one slot per concurrent query.
@@ -274,6 +300,7 @@ function newState(): QueryState {
     toolCalls: [],
     toolErrors: 0,
     textSnippets: [],
+    committed: false,
   };
 }
 
@@ -385,7 +412,16 @@ export function onAgentLine(source: string, raw: string): void {
   if (thinkingMatch) {
     state.thinkingCount++;
     send(`🧠 [${source}] ${thinkingMatch[1]}`);
-    updateReaction(source, '🤔');
+    // Engagement gate: do NOT fire 🤔 reaction here. A thinking-only
+    // turn ending in stop_reason=end_turn means the agent decided to
+    // stay silent (irrelevant message, bad-actor disengage, etc.) —
+    // showing 🤔 in that case lights up the user's chat with bot
+    // activity for messages the bot is intentionally ignoring.
+    // Reactions only fire once the agent commits via text/tool_use
+    // below.
+    if (state.committed) {
+      updateReaction(source, '🤔');
+    }
     return;
   }
 
@@ -395,6 +431,14 @@ export function onAgentLine(source: string, raw: string): void {
     // Normalize "mcp__onecli__gmail_search" → "gmail_search" for readability
     const name = toolUse[1].replace(/^mcp__[^_]+__/, '');
     state.toolCalls.push(name);
+    // First non-thinking event marks engagement. Fire the
+    // backlogged 🤔 so the user briefly sees the cycle, then the
+    // tool emoji.
+    const justCommitted = !state.committed;
+    state.committed = true;
+    if (justCommitted && state.thinkingCount > 0) {
+      updateReaction(source, '🤔');
+    }
     // mcp__nanoclaw__send_message means the agent is DELIVERING, not doing
     // more work — show the "composing" emoji instead of the "working"
     // emoji so the user sees progress: thinking → working → composing.
@@ -427,6 +471,13 @@ export function onAgentLine(source: string, raw: string): void {
   const textMatch = line.match(/^\[msg #\d+\] text="([^"]*)"/);
   if (textMatch) {
     state.textSnippets.push(textMatch[1]);
+    // Text emission is also a commit signal — the agent is producing
+    // user-visible output. Backfill 🤔 if there was thinking before.
+    const justCommitted = !state.committed;
+    state.committed = true;
+    if (justCommitted && state.thinkingCount > 0) {
+      updateReaction(source, '🤔');
+    }
     return;
   }
 
@@ -448,8 +499,18 @@ export function onAgentLine(source: string, raw: string): void {
     // overwritten that, and "tool fired" isn't a stable end-state.
     // toolCalls stores names with the `mcp__<server>__` prefix already
     // stripped (see normalization in the tool_use branch above).
+    //
+    // Engagement gate: if the turn never committed to a user-visible
+    // action (silent thinking-only turn), don't set ANY done emoji.
+    // Pass an explicit no-op skip so stopWatchdog clears its interval
+    // without writing a reaction the user didn't earn through real
+    // bot engagement.
     const lastTool = state.toolCalls[state.toolCalls.length - 1];
-    const doneEmoji = lastTool === 'send_message' ? '✍' : undefined;
+    const doneEmoji = !state.committed
+      ? '__skip__'
+      : lastTool === 'send_message'
+        ? '✍'
+        : undefined;
     stopWatchdog(source, doneEmoji);
     const wall = /wall=(\d+)ms/.exec(line)?.[1];
     const tokIn = /tokens_in=(\d+)/.exec(line)?.[1];
