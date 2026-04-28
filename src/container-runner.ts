@@ -199,7 +199,12 @@ export function buildSecretEnvFile(
  * and does not support `effort: 'max'` well. The current runner is set up
  * for 4.7's expectations.
  */
-const AGENT_MODEL = 'claude-opus-4-7[1m]';
+// Operators can override at deploy time without editing source — handy for
+// running a fork on a cheaper model (Sonnet) without forking just to change
+// this one constant. If unset, the default below is what jbaruch's main runs
+// against and what the runner is tuned for. AGENT_EFFORT (alongside this) is
+// already env-overridable in the agent-runner via VALID_AGENT_EFFORTS.
+const AGENT_MODEL = process.env.AGENT_MODEL || 'claude-opus-4-7[1m]';
 
 /**
  * Effort level the agent-runner passes to the SDK's `query()` call.
