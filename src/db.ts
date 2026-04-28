@@ -241,6 +241,15 @@ export function initDatabase(): void {
   fs.mkdirSync(path.dirname(dbPath), { recursive: true });
 
   db = new Database(dbPath);
+  // WAL keeps cross-process readers from seeing partially-written pages
+  // (the bot writes from the orchestrator while agent containers and
+  // ad-hoc sqlite3 readers query the same file). Without WAL, readers
+  // hitting a mid-write rollback journal occasionally surface a false
+  // "database disk image is malformed" error. NORMAL is the standard
+  // synchronous pairing for WAL; busy_timeout smooths the rare contention.
+  db.pragma('journal_mode = WAL');
+  db.pragma('synchronous = NORMAL');
+  db.pragma('busy_timeout = 5000');
   createSchema(db);
 
   // Migrate from JSON files if they exist
