@@ -221,8 +221,8 @@ export function buildSecretEnvFile(
 // surfaces typos at startup instead of at first `query()` call deep in
 // runtime — a typo like `claud-opus-4-7` is operator-error territory but
 // cheap to flag.
-const KNOWN_MODEL_PREFIX_RE = /^(claude|opus|sonnet|haiku)/i;
-function resolveAgentModel(raw: string | undefined): string {
+export const KNOWN_MODEL_PREFIX_RE = /^(claude|opus|sonnet|haiku)/i;
+export function resolveAgentModel(raw: string | undefined): string {
   const fallback = 'claude-opus-4-7[1m]';
   const trimmed = raw?.trim();
   if (!trimmed) return fallback;
