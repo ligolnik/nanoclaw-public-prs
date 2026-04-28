@@ -475,6 +475,34 @@ export function getMessageById(
   };
 }
 
+/**
+ * Returns true if this message_id is recorded in our DB but in a chat
+ * other than `expectedChatJid`. Returns false when the message is in
+ * `expectedChatJid` OR is absent from our DB entirely (we have no
+ * evidence either way — let the caller proceed).
+ *
+ * Used by the Telegram channel to detect cross-chat reply_to misuse:
+ * when an agent passes a message_id from chat A while sending to
+ * chat B, Telegram returns 400 ("message to be replied not found"),
+ * which the channel's outer catch swallows. Without this check, the
+ * silent failure leaves a phantom bot row in messages.db. Caller
+ * drops the reply_to with a warn when this returns true.
+ *
+ * Per-chat message ID collisions are theoretically possible (Telegram
+ * numbers per chat-bot), so we explicitly filter to chats OTHER than
+ * the expected one rather than returning the message's chat_jid —
+ * a row in `expectedChatJid` should never trigger a drop.
+ */
+export function messageExistsInDifferentChat(
+  messageId: string,
+  expectedChatJid: string,
+): boolean {
+  const row = db
+    .prepare(`SELECT 1 FROM messages WHERE id = ? AND chat_jid != ? LIMIT 1`)
+    .get(messageId, expectedChatJid) as { '1': number } | undefined;
+  return !!row;
+}
+
 export function storeReaction(reaction: {
   message_id: string;
   message_chat_jid: string;
@@ -753,6 +781,50 @@ export function pruneCompletedTasks(maxAgeMs: number): number {
       .run(cutoffIso).changes;
   });
   return tx(cutoff);
+}
+
+/**
+ * Recover once-tasks that were pre-advanced to `status='completed'`
+ * but whose dispatch never landed — `last_run` stays NULL while
+ * `next_run` still points at the originally-scheduled fire time.
+ * This is the same orphan condition that `pruneCompletedTasks` GCs
+ * after `maxAgeMs`, but flipped: instead of deleting the row once
+ * its TTL expires, this resurrects it back to `status='active'` so
+ * the next `getDueTasks()` poll picks it up and actually runs it.
+ *
+ * Intended to be called once on scheduler startup, before the first
+ * loop tick. Recurring tasks never reach `status='completed'`
+ * (computeNextRun only returns null for once-tasks), so the
+ * `schedule_type='once'` clause is defensive. Returns the list of
+ * task IDs that were resurrected, for logging.
+ *
+ * Safe to combine with `pruneCompletedTasks`: the prune cutoff and
+ * the resurrect query both target the same orphan signature, but
+ * resurrect runs first at startup and prune runs periodically — a
+ * row that resurrected and ran will have `last_run` populated and
+ * fall out of the prune predicate via the `created_at` fallback
+ * eventually. A row that resurrected and *still* failed to run will
+ * be GC'd by the next prune sweep on age.
+ */
+export function resurrectZombieTasks(): string[] {
+  const rows = db
+    .prepare(
+      `SELECT id FROM scheduled_tasks
+       WHERE status = 'completed'
+         AND schedule_type = 'once'
+         AND last_run IS NULL
+         AND next_run IS NOT NULL`,
+    )
+    .all() as { id: string }[];
+  if (rows.length === 0) return [];
+  const update = db.prepare(
+    `UPDATE scheduled_tasks SET status = 'active' WHERE id = ?`,
+  );
+  const tx = db.transaction((ids: string[]): void => {
+    for (const id of ids) update.run(id);
+  });
+  tx(rows.map((r) => r.id));
+  return rows.map((r) => r.id);
 }
 
 /**

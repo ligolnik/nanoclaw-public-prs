@@ -1170,9 +1170,6 @@ export function buildVolumeMounts(
   const isTrustedIpc = isMain || !!group.containerConfig?.trusted;
   fs.mkdirSync(path.join(groupIpcDir, 'messages'), { recursive: true });
   fs.mkdirSync(sessionInputDir, { recursive: true });
-  if (isTrustedIpc) {
-    fs.mkdirSync(path.join(groupIpcDir, 'tasks'), { recursive: true });
-  }
 
   // Wipe stale sentinel files from previous container lifecycles. A `_close`
   // left over from a graceful shutdown will be consumed by a fresh
@@ -1191,6 +1188,10 @@ export function buildVolumeMounts(
       );
     }
   }
+  if (isTrustedIpc) {
+    fs.mkdirSync(path.join(groupIpcDir, 'tasks'), { recursive: true });
+  }
+
   // Chown IPC dirs so container user can read/write/unlink files
   const ipcUid = HOST_UID ?? 1000;
   const ipcGid = HOST_GID ?? 1000;
@@ -1436,7 +1437,7 @@ function buildContainerArgs(
 
   return {
     args,
-    cleanup: secretEnvFile ? secretEnvFile.cleanup : () => {},
+    cleanup: () => {},
   };
 }
 

@@ -55,12 +55,14 @@ const PROTECTED_SPAN_TAGS = [
 ];
 
 /**
- * Telegram Bot API HTML allowlist. Any tag outside this set is not recognized
- * by Telegram's parser — stray occurrences (e.g. agent-emitted
- * `<deliveryScheduleId>` from a JSON blob) cause a 400 Bad Request. Unknown
- * tags are escaped to &lt;...&gt; at sanitize time so messages still send.
+ * Telegram's allowed HTML tags for `parse_mode=HTML`. Bot API 7.x.
+ * Anything outside this set causes Telegram to return 400 Bad Request
+ * — agent output that contains JSON blobs (`<deliveryScheduleId>`),
+ * partial XML, or framework-internal markers like `<tool_use_error>`
+ * causes production sends to fail. Phase 1b uses this to gate which
+ * stray tags pass through verbatim vs. get HTML-entity-escaped.
  */
-const TELEGRAM_ALLOWED_TAGS = new Set([
+const TELEGRAM_ALLOWED_TAGS = new Set<string>([
   'b',
   'strong',
   'i',
@@ -111,17 +113,19 @@ export function sanitizeTelegramHtml(text: string): string {
     out = out.replace(re, protect);
   }
 
-  // Phase 1b: handle stray tag tokens. If the tag is on Telegram's allowlist,
-  // protect it (pass through verbatim). If it's NOT, escape the angle
-  // brackets so `<foo>` becomes `&lt;foo&gt;` — Telegram will render it as
-  // literal text instead of rejecting the whole message. This catches
-  // JSON-dump leakage like `<deliveryScheduleId>`, partial XML, agent-tool
-  // markers like `<tool_use_error>`, etc.
+  // Phase 1b: handle stray tag tokens (self-closing, mismatched, or tags
+  // we don't recognise as span-ful). If the tag is on Telegram's
+  // allowlist, protect it (pass through verbatim). If it's NOT, escape
+  // the angle brackets so `<foo>` becomes `&lt;foo&gt;` — Telegram will
+  // render it as literal text instead of rejecting the whole message.
+  // This catches JSON-dump leakage like `<deliveryScheduleId>`, partial
+  // XML, agent-tool markers like `<tool_use_error>`, etc.
   //
-  // Tag-name character class includes `_` because Claude/agentic frameworks
-  // emit underscored tags (<tool_use_error>, <delivery_id>) frequently.
-  // HTML spec disallows underscores but Telegram still rejects them with
-  // 400 if unescaped, so we treat them like any other unknown tag.
+  // Tag-name character class includes `_` because Claude/agentic
+  // frameworks emit underscored tags (`<tool_use_error>`,
+  // `<delivery_id>`) frequently. HTML spec disallows underscores in tag
+  // names but Telegram still rejects them with 400 if unescaped, so
+  // they need the same treatment as any other unknown tag.
   out = out.replace(
     /<(\/?)([a-zA-Z][a-zA-Z0-9_-]*)((?:\s[^>]*)?)\s*(\/?)>/g,
     (match, _close: string, name: string) => {

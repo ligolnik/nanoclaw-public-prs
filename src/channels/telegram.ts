@@ -13,7 +13,12 @@ import {
   getTriggerPattern,
 } from '../config.js';
 import { createDraftStream, DraftStream } from '../draft-stream.js';
-import { getLatestMessage, getMessageById, storeReaction } from '../db.js';
+import {
+  getLatestMessage,
+  getMessageById,
+  messageExistsInDifferentChat,
+  storeReaction,
+} from '../db.js';
 import { noteLatestUserMessage } from '../observer.js';
 import { readEnvFile } from '../env.js';
 
@@ -651,10 +656,10 @@ export async function sendPoolMessage(
   text: string,
   sender: string,
   groupFolder: string,
-): Promise<void> {
+): Promise<boolean> {
   if (poolApis.length === 0) {
     // No pool bots — fall back to main bot sendMessage via channel
-    return;
+    return false;
   }
 
   const key = `${groupFolder}:${sender}`;
@@ -696,8 +701,14 @@ export async function sendPoolMessage(
       },
       'Pool message sent',
     );
+    return true;
   } catch (err) {
+    // Returning `false` lets the IPC handler skip the messages.db
+    // write — without that signal a swallowed Telegram failure
+    // (rate-limit, blocked, malformed) leaves a phantom `bot-…`
+    // row claiming the agent answered when nothing reached the user.
     logger.error({ chatId, sender, err }, 'Failed to send pool message');
+    return false;
   }
 }
 
@@ -1206,9 +1217,32 @@ export class TelegramChannel implements Channel {
       } = {};
 
       if (replyToMessageId) {
-        options.reply_parameters = {
-          message_id: parseInt(replyToMessageId, 10),
-        };
+        // Cross-chat safety: agents that target a different chat with
+        // a `reply_to` from the originating chat trip Telegram's
+        // "message to be replied not found" 400. The catch below
+        // swallows that error silently, so `sendMessage` returns
+        // undefined — but the IPC handler historically did not gate
+        // its `storeMessage` call on the return value, leaving a
+        // phantom `bot-…` row in messages.db claiming the agent
+        // answered when nothing reached the user. Heartbeat then
+        // thinks the message was answered, and downstream agents
+        // that quote-reply hallucinate a thread that doesn't exist.
+        //
+        // If our DB shows the referenced message lives in a different
+        // chat, drop the reply_to with a warn rather than ship the
+        // 400. When the message isn't in our DB we have no evidence
+        // either way — let Telegram be authoritative (the message
+        // might still exist in the target chat from another writer).
+        if (messageExistsInDifferentChat(replyToMessageId, jid)) {
+          logger.warn(
+            { jid, replyToMessageId },
+            'Dropping cross-chat reply_to (referenced message is in a different chat)',
+          );
+        } else {
+          options.reply_parameters = {
+            message_id: parseInt(replyToMessageId, 10),
+          };
+        }
       }
 
       // Split respecting content boundaries (code blocks, paragraphs, etc.)

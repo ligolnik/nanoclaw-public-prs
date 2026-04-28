@@ -754,7 +754,7 @@ async function runQuery(
       // our multi-tool-call agentic workflow. Safe on 4.6/Sonnet 4.6 (both
       // support adaptive and will use it over the deprecated manual mode).
       //
-      // `display: 'summarized'` is required on Opus 4.7 to get readable
+      // `display: 'summarized'` is required on Opus 4.7+ to get readable
       // thinking content. Anthropic changed the default to `'omitted'` on
       // 4.7 (faster streaming, but `block.thinking` comes back as empty
       // string with only a signature blob). Older models default to
@@ -900,6 +900,43 @@ async function runQuery(
             lastStreamEmit = now;
           }
         }
+        // Detect explicit user-facing send tool invocations during this
+        // turn. Stash the tool_use id so we can match the corresponding
+        // tool_result below — we only suppress the SDK's final text once
+        // we've seen a non-error result for one of these calls.
+        for (const block of content) {
+          if (
+            block.type === 'tool_use' &&
+            block.id &&
+            (block.name === 'mcp__nanoclaw__send_message' ||
+              block.name === 'mcp__nanoclaw__send_voice' ||
+              block.name === 'mcp__nanoclaw__send_file')
+          ) {
+            pendingUserFacingToolUseIds.add(block.id);
+          }
+        }
+      }
+    }
+
+    // Track successful results for the send tools we recorded above.
+    // The SDK emits tool_result blocks inside `user`-typed messages.
+    // If `is_error` is true (rate limit, hook denial, exception), the
+    // user never received the message — leave userFacingSendSucceeded
+    // alone so the SDK's final text still goes out and the user sees
+    // *something*.
+    if (message.type === 'user') {
+      const userContent = (message as { message?: { content?: Array<{ type: string; tool_use_id?: string; is_error?: boolean }> } }).message?.content;
+      if (userContent) {
+        for (const block of userContent) {
+          if (
+            block.type === 'tool_result' &&
+            block.tool_use_id &&
+            pendingUserFacingToolUseIds.has(block.tool_use_id) &&
+            block.is_error !== true
+          ) {
+            userFacingSendSucceeded = true;
+          }
+        }
       }
     }
 
@@ -988,10 +1025,11 @@ async function runQuery(
       // query, the SDK's final result.text is a closing summary aimed at
       // the harness, not a second user reply. Pass result=null so the
       // orchestrator's onOutput callback skips its sendMessage path
-      // (it's gated on `if (result.result)`). Without this, models that
-      // don't reliably wrap closing thoughts in <internal>…</internal>
-      // produce visible duplicates: the explicit send_message goes out,
-      // then the closing summary goes out as a second message.
+      // (it's gated on `if (result.result)` in src/index.ts). Without
+      // this, models that don't reliably wrap closing thoughts in
+      // <internal>…</internal> produce visible duplicates: the explicit
+      // send_message goes out, then the closing summary goes out as a
+      // second message ("Awake, bud" + "Confirmed.").
       const suppressFinalText = userFacingSendSucceeded && !!textResult;
       if (suppressFinalText) {
         log(

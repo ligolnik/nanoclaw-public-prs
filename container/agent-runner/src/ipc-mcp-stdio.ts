@@ -99,7 +99,7 @@ const server = new McpServer({
 
 server.tool(
   'send_message',
-  "Send a message to the user or group immediately while you're still running. Use this for progress updates or to send multiple messages. You can call this multiple times. Use reply_to with a message ID to quote-reply a specific message. To send to a different chat (cross-chat broadcast from main), pass chat_jid — only main containers may target other chats; trusted/untrusted containers can only target their own chat regardless of what's passed (host-side authz enforces this).",
+  "Send a message to the user or group immediately while you're still running. Use this for progress updates or to send multiple messages. You can call this multiple times. Use reply_to with a message ID to quote-reply a specific message. To send to a different chat (cross-chat broadcast from main), pass chat_jid — only main containers may target other chats; trusted/untrusted containers can only target their own chat regardless of what's passed (host-side authz enforces this). When chat_jid is set, do NOT pass reply_to unless you have a message ID from the TARGET chat — Telegram message IDs are per-chat, so a source-chat ID will resolve to an unrelated message in the target chat.",
   {
     text: z.string().describe('The message text to send'),
     sender: z
@@ -108,7 +108,7 @@ server.tool(
       .describe(
         'Your role/identity name (e.g. "Researcher"). When set, messages appear from a dedicated bot in Telegram.',
       ),
-    reply_to: z.string().optional().describe('Message ID to reply to (quote). Get this from the [id=...] tag in the message prompt. If omitted, auto-replies to the most recent incoming message (first call only).'),
+    reply_to: z.string().optional().describe('Message ID to reply to (quote). Get this from the [id=...] tag in the message prompt. If omitted, the message is sent without quote-threading. For cross-chat sends (chat_jid set), only pass this if it refers to a message in the TARGET chat — Telegram message IDs are per-chat.'),
     pin: z.boolean().optional().describe('Pin this message in the chat after sending. Use for important messages like daily briefs.'),
     chat_jid: z
       .string()
@@ -127,7 +127,11 @@ server.tool(
       timestamp: new Date().toISOString(),
     };
 
-    // Only reply-thread when explicitly requested
+    // Only reply-thread when the caller explicitly passes reply_to.
+    // We never auto-fill from "the most recent incoming message" — that
+    // pattern silently misthreads cross-chat broadcasts: Telegram message
+    // IDs are per-chat, so a source-chat ID resolves to an unrelated
+    // message in the target chat. See nanoclaw-public#7.
     if (args.reply_to) {
       data.replyToMessageId = args.reply_to;
     }
