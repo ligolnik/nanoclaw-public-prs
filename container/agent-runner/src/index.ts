@@ -613,8 +613,22 @@ async function runQuery(
           : {}),
       },
     },
-    // Composio removed — this deployment uses OneCLI for third-party app auth.
-    // See the `onecli` MCP block below.
+    // Composio MCP — keep upstream's optional Composio path so operators
+    // can enable it by setting COMPOSIO_API_KEY. OneCLI (below) is an
+    // alternative for the same job (gcal/gmail/etc with transparent
+    // OAuth) and the two are not mutually exclusive — run either or
+    // both. Whichever credential the operator sets is what registers.
+    ...(process.env.COMPOSIO_API_KEY
+      ? {
+          composio: {
+            type: 'http' as const,
+            url: 'https://connect.composio.dev/mcp',
+            headers: {
+              'x-consumer-api-key': process.env.COMPOSIO_API_KEY,
+            },
+          },
+        }
+      : {}),
     // OneCLI MCP — structured tools (gcal_*, gmail_*, ...) that route through
     // the OneCLI gateway for transparent OAuth injection. Only register when
     // HTTPS_PROXY is set, which container-runner.ts does for main + trusted.
