@@ -14,6 +14,7 @@ import {
 } from '../db.js';
 import { readEnvFile } from '../env.js';
 import { logger } from '../logger.js';
+import { noteLatestUserMessage } from '../observer.js';
 import { registerChannel, ChannelOpts } from './registry.js';
 import { sanitizeTelegramHtml } from './telegram-sanitize.js';
 import {
@@ -814,6 +815,11 @@ export class TelegramChannel implements Channel {
         { chatJid, chatName, sender: senderName },
         'Telegram message stored',
       );
+
+      // Tell the observer which message ID is "live" in this chat so it
+      // can update the reaction emoji as the agent progresses (👀 → 🤔 →
+      // ⚡ → ✍). No-op when OBSERVER_CHAT_JID isn't set.
+      noteLatestUserMessage(chatJid, msgId);
     });
 
     // Handle non-text messages with placeholders so the agent knows something was sent

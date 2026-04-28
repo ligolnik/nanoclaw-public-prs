@@ -84,6 +84,7 @@ import {
 import { startSchedulerLoop } from './task-scheduler.js';
 import { Channel, NewMessage, RegisteredGroup } from './types.js';
 import { logger } from './logger.js';
+import { initObserver } from './observer.js';
 
 // Re-export for backwards compatibility during refactor
 export { escapeXml, formatMessages } from './router.js';
@@ -1022,6 +1023,10 @@ async function main(): Promise<void> {
   if (TELEGRAM_BOT_POOL.length > 0) {
     await initBotPool(TELEGRAM_BOT_POOL);
   }
+
+  // Initialize the optional observer channel — opt-in via OBSERVER_CHAT_JID
+  // env var (no-op when unset). See src/observer.ts.
+  initObserver(channels, () => registeredGroups);
 
   // Start subsystems (independently of connection handler)
   startSchedulerLoop({

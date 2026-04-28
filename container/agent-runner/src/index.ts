@@ -444,6 +444,14 @@ async function runQuery(
   const stream = new MessageStream();
   stream.push(prompt);
 
+  // Observability: emit a structured "query started" stderr line so the
+  // optional observer channel (src/observer.ts) can detect query
+  // boundaries and arm its watchdog. Whitespace-collapsed and length-
+  // capped at 400 chars so each query is exactly one log line.
+  log(
+    `Query input: ${prompt.length} chars, preview="${prompt.replace(/\s+/g, ' ').slice(0, 400)}"`,
+  );
+
   // Poll IPC for the _close sentinel during the query. We deliberately do
   // NOT drain JSON message files here — there's a race where pollIpc fires
   // after the SDK has emitted Result and agent-runner has broken out of
@@ -747,8 +755,14 @@ async function runQuery(
 
     if (message.type === 'assistant' && 'uuid' in message) {
       lastAssistantUuid = (message as { uuid: string }).uuid;
-      // Extract text content for streaming preview
-      const content = (message as { message?: { content?: Array<{ type: string; text?: string; name?: string; id?: string }> } }).message?.content;
+      // Extract text content for streaming preview, and emit per-block
+      // observability log lines so the optional observer channel
+      // (src/observer.ts on the host) can mirror live agent reasoning
+      // to a status chat. These lines have no behavioral effect — they
+      // go to stderr (docker logs) only. The observer parses them via
+      // regex when OBSERVER_CHAT_JID is set; when unset, they're just
+      // useful post-mortem context.
+      const content = (message as { message?: { content?: Array<{ type: string; text?: string; thinking?: string; name?: string; id?: string; input?: unknown }> } }).message?.content;
       if (content) {
         const text = content
           .filter((c) => c.type === 'text' && c.text)
@@ -762,41 +776,72 @@ async function runQuery(
             lastStreamEmit = now;
           }
         }
-        // Detect explicit user-facing send tool invocations during this
-        // turn. Stash the tool_use id so we can match the corresponding
-        // tool_result below — we only suppress the SDK's final text once
-        // we've seen a non-error result for one of these calls.
+        // Per-block observability lines (whitespace collapsed so each
+        // block is one stderr line; downstream parsers split on \n).
+        // Also stash any user-facing send tool_use ids so the
+        // success-gated suppression branch below can match them up
+        // with their tool_result.
         for (const block of content) {
-          if (
-            block.type === 'tool_use' &&
-            block.id &&
-            (block.name === 'mcp__nanoclaw__send_message' ||
-              block.name === 'mcp__nanoclaw__send_voice' ||
-              block.name === 'mcp__nanoclaw__send_file')
-          ) {
-            pendingUserFacingToolUseIds.add(block.id);
+          if (block.type === 'thinking' && block.thinking) {
+            log(
+              `[msg #${messageCount}] thinking="${block.thinking.replace(/\s+/g, ' ')}"`,
+            );
+          } else if (block.type === 'redacted_thinking') {
+            log(`[msg #${messageCount}] redacted_thinking (encrypted)`);
+          } else if (block.type === 'text' && block.text) {
+            log(
+              `[msg #${messageCount}] text="${block.text.replace(/\s+/g, ' ').slice(0, 400)}"`,
+            );
+          } else if (block.type === 'tool_use') {
+            const inputStr = JSON.stringify(block.input ?? {}).slice(0, 400);
+            log(
+              `[msg #${messageCount}] tool_use=${block.name} id=${block.id} input=${inputStr}`,
+            );
+            if (
+              block.id &&
+              (block.name === 'mcp__nanoclaw__send_message' ||
+                block.name === 'mcp__nanoclaw__send_voice' ||
+                block.name === 'mcp__nanoclaw__send_file')
+            ) {
+              pendingUserFacingToolUseIds.add(block.id);
+            }
           }
         }
       }
-    }
-
-    // Track successful results for the send tools we recorded above.
-    // The SDK emits tool_result blocks inside `user`-typed messages.
-    // If `is_error` is true (rate limit, hook denial, exception), the
-    // user never received the message — leave userFacingSendSucceeded
-    // alone so the SDK's final text still goes out and the user sees
-    // *something*.
-    if (message.type === 'user') {
-      const userContent = (message as { message?: { content?: Array<{ type: string; tool_use_id?: string; is_error?: boolean }> } }).message?.content;
-      if (userContent) {
-        for (const block of userContent) {
-          if (
-            block.type === 'tool_result' &&
-            block.tool_use_id &&
-            pendingUserFacingToolUseIds.has(block.tool_use_id) &&
-            block.is_error !== true
-          ) {
-            userFacingSendSucceeded = true;
+    } else if (message.type === 'user' && 'message' in message) {
+      // tool_result lives on user-typed messages following a tool_use.
+      // Log success/error + a short preview so observers can spot tool
+      // failures live and so post-mortem `docker logs` greps work.
+      // Also flip the user-facing-send-succeeded flag here (only on
+      // non-error results) so the final-text suppression at result-
+      // time doesn't fire for hook-denied or errored sends.
+      const content = (
+        message as {
+          message?: {
+            content?: Array<{
+              type: string;
+              tool_use_id?: string;
+              is_error?: boolean;
+              content?: unknown;
+            }>;
+          };
+        }
+      ).message?.content;
+      if (content) {
+        for (const block of content) {
+          if (block.type === 'tool_result') {
+            const status = block.is_error ? 'error' : 'ok';
+            const preview = JSON.stringify(block.content ?? '').slice(0, 200);
+            log(
+              `[msg #${messageCount}] tool_result id=${block.tool_use_id} ${status} preview=${preview}`,
+            );
+            if (
+              block.tool_use_id &&
+              pendingUserFacingToolUseIds.has(block.tool_use_id) &&
+              block.is_error !== true
+            ) {
+              userFacingSendSucceeded = true;
+            }
           }
         }
       }
