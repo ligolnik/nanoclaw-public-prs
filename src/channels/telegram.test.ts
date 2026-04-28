@@ -24,6 +24,20 @@ vi.mock('../logger.js', () => ({
   },
 }));
 
+// Mock db — telegram.ts imports a few helpers from `../db.js`. The
+// only one our `sendMessage` cares about for this test file is
+// `messageExistsInDifferentChat`, which guards cross-chat reply_to.
+// Default to `false` (no evidence message lives elsewhere → preserve
+// reply_to) so existing tests keep their semantics; individual
+// cross-chat tests below override per-call.
+const messageExistsInDifferentChatMock = vi.hoisted(() => vi.fn(() => false));
+vi.mock('../db.js', () => ({
+  getLatestMessage: vi.fn(() => null),
+  getMessageById: vi.fn(() => null),
+  messageExistsInDifferentChat: messageExistsInDifferentChatMock,
+  storeReaction: vi.fn(),
+}));
+
 // --- Grammy mock ---
 
 type Handler = (...args: any[]) => any;
@@ -83,7 +97,11 @@ vi.mock('grammy', () => ({
   },
 }));
 
-import { TelegramChannel, TelegramChannelOpts } from './telegram.js';
+import {
+  TelegramChannel,
+  TelegramChannelOpts,
+  sendPoolMessage,
+} from './telegram.js';
 
 // --- Test helpers ---
 
@@ -827,6 +845,70 @@ describe('TelegramChannel', () => {
 
       // No error, no API call
     });
+
+    it('passes reply_parameters when replyToMessageId is local to the target chat', async () => {
+      // messageExistsInDifferentChat returns false by default (mock
+      // hoisted at top of file). With no cross-chat evidence, the
+      // reply_to should be forwarded to Telegram unchanged.
+      const opts = createTestOpts();
+      const channel = new TelegramChannel('test-token', opts);
+      await channel.connect();
+
+      await channel.sendMessage('tg:100200300', 'Hello', '4242');
+
+      expect(currentBot().api.sendMessage).toHaveBeenCalledWith(
+        '100200300',
+        'Hello',
+        {
+          parse_mode: 'HTML',
+          reply_parameters: { message_id: 4242 },
+        },
+      );
+    });
+
+    it('drops reply_parameters when the referenced message lives in a different chat', async () => {
+      // Reproduce the production bug: agent in chat A calls
+      // send_message(chat_jid: B, reply_to: msg-from-A). Telegram
+      // returns 400 "message to be replied not found" and the catch
+      // swallows it silently. The DB knows that message lives in a
+      // different chat, so we should drop reply_to before sending.
+      messageExistsInDifferentChatMock.mockReturnValueOnce(true);
+
+      const opts = createTestOpts();
+      const channel = new TelegramChannel('test-token', opts);
+      await channel.connect();
+
+      await channel.sendMessage('tg:100200300', 'Cross-chat hello', '6968');
+
+      // No reply_parameters in the options — just parse_mode.
+      expect(currentBot().api.sendMessage).toHaveBeenCalledWith(
+        '100200300',
+        'Cross-chat hello',
+        { parse_mode: 'HTML' },
+      );
+      expect(messageExistsInDifferentChatMock).toHaveBeenCalledWith(
+        '6968',
+        'tg:100200300',
+      );
+    });
+
+    it('returns the sent message id on success', async () => {
+      const opts = createTestOpts();
+      const channel = new TelegramChannel('test-token', opts);
+      await channel.connect();
+
+      currentBot().api.sendMessage.mockResolvedValueOnce({
+        message_id: 7777,
+      });
+
+      const result = await channel.sendMessage('tg:100200300', 'ok');
+
+      // IPC handler now gates `storeMessage` on this return value, so
+      // a truthy id is the success contract. Failures still resolve to
+      // undefined (covered by the existing 'handles send failure
+      // gracefully' test above).
+      expect(result).toBe('7777');
+    });
   });
 
   // --- sendFile ---
@@ -1085,5 +1167,28 @@ describe('TelegramChannel', () => {
       const channel = new TelegramChannel('test-token', createTestOpts());
       expect(channel.name).toBe('telegram');
     });
+  });
+});
+
+// --- sendPoolMessage (module function) ---
+
+describe('sendPoolMessage', () => {
+  // The pool is module-level state, populated by `initBotPool()` with
+  // real `grammy.Api` instances. Without that setup, `poolApis` is
+  // empty — we exercise the empty-pool branch here, which exists for
+  // exactly the case where the user hasn't configured any pool tokens.
+  //
+  // The contract that matters to callers (IPC handler) is the boolean
+  // return value: `false` → IPC must skip `storeMessage`. Pre-fix this
+  // function returned `Promise<void>`, leaving IPC no signal to gate
+  // on, which is half of the production bug being fixed in this PR.
+  it('returns false when no pool bots are configured', async () => {
+    const result = await sendPoolMessage(
+      'tg:100200300',
+      'hello',
+      'TestSender',
+      'telegram_test-group',
+    );
+    expect(result).toBe(false);
   });
 });
