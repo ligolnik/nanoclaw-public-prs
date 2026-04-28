@@ -512,12 +512,20 @@ export function onAgentLine(source: string, raw: string): void {
   const textMatch = line.match(/^\[msg #\d+\] text="([^"]*)"/);
   if (textMatch) {
     state.textSnippets.push(textMatch[1]);
-    // Text emission is also a commit signal — the agent is producing
-    // user-visible output. Backfill 🤔 if there was thinking before.
-    const justCommitted = !state.committed;
-    state.committed = true;
-    if (justCommitted && state.thinkingCount > 0) {
-      updateReaction(source, '🤔');
+    // Text emission is a commit signal ONLY if there's user-visible
+    // content. Text wrapped fully in `<internal>…</internal>` is the
+    // agent's "I read this but I'm staying silent" pattern — the
+    // host strips it before sending and counts it as a non-reply
+    // for accounting purposes. Treating it as commitment fires
+    // 🤝 (DONE_REACTION) on irrelevant messages, lighting up the
+    // chat for things the bot is intentionally ignoring.
+    const stripped = textMatch[1].replace(/<internal>[\s\S]*?<\/internal>/g, '').trim();
+    if (stripped.length > 0) {
+      const justCommitted = !state.committed;
+      state.committed = true;
+      if (justCommitted && state.thinkingCount > 0) {
+        updateReaction(source, '🤔');
+      }
     }
     return;
   }
