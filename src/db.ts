@@ -498,9 +498,7 @@ export function messageExistsInDifferentChat(
   expectedChatJid: string,
 ): boolean {
   const row = db
-    .prepare(
-      `SELECT 1 FROM messages WHERE id = ? AND chat_jid != ? LIMIT 1`,
-    )
+    .prepare(`SELECT 1 FROM messages WHERE id = ? AND chat_jid != ? LIMIT 1`)
     .get(messageId, expectedChatJid) as { '1': number } | undefined;
   return !!row;
 }

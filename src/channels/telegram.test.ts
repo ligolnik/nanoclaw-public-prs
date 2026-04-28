@@ -30,9 +30,7 @@ vi.mock('../logger.js', () => ({
 // Default to `false` (no evidence message lives elsewhere → preserve
 // reply_to) so existing tests keep their semantics; individual
 // cross-chat tests below override per-call.
-const messageExistsInDifferentChatMock = vi.hoisted(() =>
-  vi.fn(() => false),
-);
+const messageExistsInDifferentChatMock = vi.hoisted(() => vi.fn(() => false));
 vi.mock('../db.js', () => ({
   getLatestMessage: vi.fn(() => null),
   getMessageById: vi.fn(() => null),
