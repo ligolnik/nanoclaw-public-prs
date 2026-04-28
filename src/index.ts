@@ -897,14 +897,6 @@ async function main(): Promise<void> {
     PROXY_BIND_HOST,
   );
 
-  // Observer: if OBSERVER_CHAT_JID is set, container-runner's stderr
-  // parser will forward per-query summaries + live error alerts there.
-  // Also drives progress reactions on user messages (👀 → 🤔 → 🔧 → ✍).
-  // Awaited so the privacy-gate verification (refuse to enable if the
-  // configured chat is a multi-participant group) finishes before we
-  // start spawning queries that would feed the observer.
-  await initObserver(channels, () => registeredGroups);
-
   // Main group bypasses the concurrency cap so user-facing replies are
   // never queued behind background heartbeats or other groups.
   queue.setIsMainGroupResolver((jid) => !!registeredGroups[jid]?.isMain);
@@ -1035,6 +1027,17 @@ async function main(): Promise<void> {
   if (TELEGRAM_BOT_POOL.length > 0) {
     await initBotPool(TELEGRAM_BOT_POOL);
   }
+
+  // Observer: if OBSERVER_CHAT_JID is set, container-runner's stderr
+  // parser forwards per-query summaries + live error alerts there.
+  // Also drives progress reactions on user messages (👀 → 🤔 → 🔧 → ✍).
+  // Must run AFTER channel.connect() above — initObserver looks up
+  // the connected channel that owns OBSERVER_CHAT_JID, and that lookup
+  // returns nothing if channels[] is still empty. Awaited so the
+  // privacy-gate verification (refuse to enable if the configured
+  // chat is a multi-participant group) finishes before we start
+  // spawning queries that would feed the observer.
+  await initObserver(channels, () => registeredGroups);
 
   // Start subsystems (independently of connection handler)
   startSchedulerLoop({
