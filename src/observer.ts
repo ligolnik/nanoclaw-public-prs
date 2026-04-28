@@ -542,7 +542,9 @@ export function onAgentLine(source: string, raw: string): void {
     // for accounting purposes. Treating it as commitment fires
     // 🤝 (DONE_REACTION) on irrelevant messages, lighting up the
     // chat for things the bot is intentionally ignoring.
-    const stripped = textMatch[1].replace(/<internal>[\s\S]*?<\/internal>/g, '').trim();
+    const stripped = textMatch[1]
+      .replace(/<internal>[\s\S]*?<\/internal>/g, '')
+      .trim();
     if (stripped.length > 0) {
       const justCommitted = !state.committed;
       state.committed = true;
