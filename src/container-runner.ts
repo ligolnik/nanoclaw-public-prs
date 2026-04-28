@@ -232,8 +232,8 @@ export function buildSecretEnvFile(
 // release, and a missed model would block legit upgrades. The warn
 // surfaces typos at startup instead of at first `query()` call deep in
 // runtime.
-const KNOWN_MODEL_PREFIX_RE = /^(claude|opus|sonnet|haiku)/i;
-function resolveAgentModel(raw: string | undefined): string {
+export const KNOWN_MODEL_PREFIX_RE = /^(claude|opus|sonnet|haiku)/i;
+export function resolveAgentModel(raw: string | undefined): string {
   const fallback = 'claude-sonnet-4-6[1m]';
   const trimmed = raw?.trim();
   if (!trimmed) return fallback;
