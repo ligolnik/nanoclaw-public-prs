@@ -990,6 +990,7 @@ export class TelegramChannel implements Channel {
 
       const timestamp = new Date(ctx.message.date * 1000).toISOString();
       const senderName = buildSenderName(ctx.from);
+      const msgId = ctx.message.message_id.toString();
       const isGroup =
         ctx.chat.type === 'group' || ctx.chat.type === 'supergroup';
       this.opts.onChatMetadata(
@@ -999,6 +1000,32 @@ export class TelegramChannel implements Channel {
         'telegram',
         isGroup,
       );
+
+      // Emit the processing reactions immediately — before transcription,
+      // which can take 5–30 seconds. The user has no visual feedback that
+      // their voice note was received until the bot replies; without this
+      // the message sits silently while Whisper runs.
+      //
+      // Trust gating mirrors the text handler: auto-react only in contexts
+      // where engagement is guaranteed (main + trusted groups with no
+      // trigger requirement). For trigger-required groups we can't know
+      // whether the transcript will contain the trigger until after
+      // transcription, so 👀 fires speculatively here and the observer's
+      // updateReaction will advance the cycle once the agent starts working.
+      // This matches the user's expectation: every received voice note
+      // should signal "I got it" immediately.
+      const requiresTrigger = group.requiresTrigger !== false && !group.isMain;
+      const isTrustedVoice = group.isMain || !!group.containerConfig?.trusted;
+      if (!requiresTrigger || isTrustedVoice) {
+        // Register the message so the observer can attach progress reactions
+        // (🤔 → ⚡ → ✍) keyed to this message ID as the agent works.
+        noteLatestUserMessage(chatJid, msgId);
+        if (isTrustedVoice) {
+          this.sendReaction(chatJid, msgId, '👀').catch(() => {
+            /* already logged inside sendReaction */
+          });
+        }
+      }
 
       let content: string;
       try {
@@ -1031,6 +1058,21 @@ export class TelegramChannel implements Channel {
             lowered.includes('lim-lom');
           if (named && !TRIGGER_PATTERN.test(content)) {
             content = `@${ASSISTANT_NAME} ${content}`;
+          }
+          // For trigger-required groups: now that we have the transcript
+          // we can check whether the trigger was spoken. If yes, register
+          // the message for observer reactions and emit 👀 (the initial
+          // reaction lands after transcription but before agent processing).
+          if (requiresTrigger) {
+            const triggerHit = getTriggerPattern(group.trigger).test(
+              content.trim(),
+            );
+            if (triggerHit) {
+              noteLatestUserMessage(chatJid, msgId);
+              this.sendReaction(chatJid, msgId, '👀').catch(() => {
+                /* already logged */
+              });
+            }
           }
         }
       } catch (err) {

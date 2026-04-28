@@ -46,6 +46,15 @@ vi.mock('../db.js', () => ({
   storeReaction: vi.fn(),
 }));
 
+// Mock observer — `noteLatestUserMessage` is called by the voice handler
+// to register the message ID for the observer's 🤔/⚡/✍ reaction cycle.
+// The real impl writes to a module-level Map; mock it so tests don't
+// bleed state across each other and can assert it was called.
+const noteLatestUserMessageMock = vi.hoisted(() => vi.fn());
+vi.mock('../observer.js', () => ({
+  noteLatestUserMessage: noteLatestUserMessageMock,
+}));
+
 // --- Grammy mock ---
 
 type Handler = (...args: any[]) => any;
@@ -70,6 +79,9 @@ vi.mock('grammy', () => ({
       sendMessage: vi.fn().mockResolvedValue({ message_id: 999 }),
       sendChatAction: vi.fn().mockResolvedValue(undefined),
       sendDocument: vi.fn().mockResolvedValue({ message_id: 1001 }),
+      raw: {
+        setMessageReaction: vi.fn().mockResolvedValue(undefined),
+      },
     };
 
     constructor(token: string) {
@@ -659,6 +671,101 @@ describe('TelegramChannel', () => {
           content: '[Voice message - transcription failed]',
         }),
       );
+    });
+
+    // --- voice message reactions (fix for #14 / lombot#17) ---
+
+    it('emits 👀 reaction and noteLatestUserMessage immediately on voice in main group', async () => {
+      // isMain group: no trigger required — reactions should fire BEFORE
+      // transcription completes (i.e. before onMessage is called).
+      const opts = createTestOpts({
+        registeredGroups: vi.fn(() => ({
+          'tg:100200300': {
+            name: 'Main',
+            folder: 'main',
+            trigger: '@Andy',
+            isMain: true,
+            added_at: '2024-01-01T00:00:00.000Z',
+          },
+        })),
+      });
+      const channel = new TelegramChannel('test-token', opts);
+      await channel.connect();
+
+      const ctx = createMediaCtx({
+        messageId: 8932,
+        extra: { voice: { file_id: 'v1' } },
+      });
+      await triggerMediaMessage('message:voice', ctx);
+
+      // noteLatestUserMessage must be called so the observer can attach
+      // 🤔/⚡/✍ reactions as the agent works on the transcript.
+      expect(noteLatestUserMessageMock).toHaveBeenCalledWith(
+        'tg:100200300',
+        '8932',
+      );
+      // 👀 reaction must fire on the voice message (setMessageReaction
+      // is the Telegram API call behind sendReaction).
+      expect(currentBot().api.raw.setMessageReaction).toHaveBeenCalledWith(
+        expect.objectContaining({
+          chat_id: '100200300',
+          message_id: 8932,
+          reaction: [{ type: 'emoji', emoji: '👀' }],
+        }),
+      );
+      // onMessage still fires with the (failed) transcription result
+      expect(opts.onMessage).toHaveBeenCalledWith(
+        'tg:100200300',
+        expect.objectContaining({ id: '8932' }),
+      );
+    });
+
+    it('emits 👀 reaction on voice in trusted group', async () => {
+      const opts = createTestOpts({
+        registeredGroups: vi.fn(() => ({
+          'tg:100200300': {
+            name: 'Trusted Group',
+            folder: 'trusted',
+            trigger: '@Andy',
+            requiresTrigger: true,
+            containerConfig: { trusted: true },
+            added_at: '2024-01-01T00:00:00.000Z',
+          },
+        })),
+      });
+      const channel = new TelegramChannel('test-token', opts);
+      await channel.connect();
+
+      const ctx = createMediaCtx({
+        messageId: 42,
+        extra: { voice: { file_id: 'v2' } },
+      });
+      await triggerMediaMessage('message:voice', ctx);
+
+      expect(noteLatestUserMessageMock).toHaveBeenCalledWith('tg:100200300', '42');
+      expect(currentBot().api.raw.setMessageReaction).toHaveBeenCalledWith(
+        expect.objectContaining({
+          chat_id: '100200300',
+          message_id: 42,
+          reaction: [{ type: 'emoji', emoji: '👀' }],
+        }),
+      );
+    });
+
+    it('does NOT emit 👀 or noteLatestUserMessage on voice in untrusted trigger-required group', async () => {
+      // Default createTestOpts() group has no isMain and no trusted flag.
+      // requiresTrigger is undefined (defaults to true). The reaction
+      // block must be skipped — we don't know whether the transcript will
+      // contain the trigger word.
+      const opts = createTestOpts();
+      const channel = new TelegramChannel('test-token', opts);
+      await channel.connect();
+
+      const ctx = createMediaCtx({ extra: { voice: { file_id: 'v3' } } });
+      await triggerMediaMessage('message:voice', ctx);
+
+      expect(noteLatestUserMessageMock).not.toHaveBeenCalled();
+      expect(currentBot().api.raw.setMessageReaction).not.toHaveBeenCalled();
     });
 
     it('stores audio with placeholder', async () => {
