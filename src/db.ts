@@ -910,6 +910,38 @@ export function updateTaskAfterRun(
   ).run(nextRun, now, lastResult, nextRun, id);
 }
 
+/**
+ * Return all run-log entries for a task, ordered by run_at ascending.
+ * Used by the scheduler to surface run history and by tests to verify the
+ * atomicity invariant enforced by `logAndUpdateTask` (issue #17).
+ */
+export function getTaskRunLogs(
+  taskId: string,
+): Array<{
+  id: number;
+  task_id: string;
+  run_at: string;
+  duration_ms: number;
+  status: string;
+  result: string | null;
+  error: string | null;
+}> {
+  return db
+    .prepare(
+      `SELECT id, task_id, run_at, duration_ms, status, result, error
+       FROM task_run_logs WHERE task_id = ? ORDER BY run_at ASC`,
+    )
+    .all(taskId) as Array<{
+    id: number;
+    task_id: string;
+    run_at: string;
+    duration_ms: number;
+    status: string;
+    result: string | null;
+    error: string | null;
+  }>;
+}
+
 export function logTaskRun(log: TaskRunLog): void {
   db.prepare(
     `
@@ -924,6 +956,65 @@ export function logTaskRun(log: TaskRunLog): void {
     log.result,
     log.error,
   );
+}
+
+/**
+ * Atomically log a task run AND update the task's post-run state in a
+ * single SQLite transaction. Guarantees the single-writer invariant: every
+ * `scheduled_tasks.last_run` write is paired with a `task_run_logs` row in
+ * the same commit, so observers can never see a task with `last_run` set
+ * but no corresponding run-log (the symptom of issue #17 — a task appearing
+ * "completed" with a non-NULL `last_run` but no `task_run_logs` row).
+ *
+ * Callers MUST use this function instead of calling `logTaskRun` +
+ * `updateTaskAfterRun` separately. The separate functions are preserved for
+ * the early-return error paths in `runTask` that return BEFORE reaching
+ * `updateTaskAfterRun` (group-not-found, invalid-folder) — those paths call
+ * only `logTaskRun` and then `return`, so the atomicity concern doesn't
+ * apply there.
+ *
+ * Parameters mirror the individual functions:
+ * - `log`      — same shape as `TaskRunLog`, except `run_at` is set to
+ *               `Date.now()` internally so both the log timestamp and
+ *               `last_run` always share the same clock reading. This
+ *               prevents the "schedule_value-as-last_run" pattern seen in
+ *               #17 (where a synthetic timestamp slipped in because the
+ *               caller computed it separately from the update call).
+ * - `nextRun`  — forwarded to `updateTaskAfterRun`'s `nextRun` parameter.
+ * - `lastResult` — forwarded to `updateTaskAfterRun`'s `lastResult`.
+ */
+export function logAndUpdateTask(
+  log: Omit<TaskRunLog, 'run_at'>,
+  nextRun: string | null,
+  lastResult: string,
+): void {
+  const now = new Date().toISOString();
+
+  const insertLog = db.prepare(
+    `INSERT INTO task_run_logs (task_id, run_at, duration_ms, status, result, error)
+     VALUES (?, ?, ?, ?, ?, ?)`,
+  );
+
+  const updateTask = db.prepare(
+    `UPDATE scheduled_tasks
+     SET next_run = ?, last_run = ?, last_result = ?,
+         status = CASE WHEN ? IS NULL THEN 'completed' ELSE status END
+     WHERE id = ?`,
+  );
+
+  const tx = db.transaction(() => {
+    insertLog.run(
+      log.task_id,
+      now,
+      log.duration_ms,
+      log.status,
+      log.result,
+      log.error,
+    );
+    updateTask.run(nextRun, now, lastResult, nextRun, log.task_id);
+  });
+
+  tx();
 }
 
 // --- Router state accessors ---

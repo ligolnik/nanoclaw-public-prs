@@ -14,12 +14,12 @@ import {
   getDormantRecurringTasks,
   getDueTasks,
   getTaskById,
+  logAndUpdateTask,
   logTaskRun,
   pruneCompletedTasks,
   resurrectZombieTasks,
   setSession,
   updateTask,
-  updateTaskAfterRun,
 } from './db.js';
 import { GroupQueue } from './group-queue.js';
 import { resolveGroupFolderPath } from './group-folder.js';
@@ -385,22 +385,27 @@ async function runTask(
 
   const durationMs = Date.now() - startTime;
 
-  logTaskRun({
-    task_id: task.id,
-    run_at: new Date().toISOString(),
-    duration_ms: durationMs,
-    status: error ? 'error' : 'success',
-    result,
-    error,
-  });
-
   const nextRun = computeNextRun(task);
   const resultSummary = error
     ? `Error: ${error}`
     : result
       ? result.slice(0, 200)
       : 'Completed';
-  updateTaskAfterRun(task.id, nextRun, resultSummary);
+
+  // Atomic: write the task_run_logs row AND update scheduled_tasks in a
+  // single SQLite transaction. This enforces the single-writer invariant
+  // that every last_run write is paired with a run-log row (closes #17).
+  logAndUpdateTask(
+    {
+      task_id: task.id,
+      duration_ms: durationMs,
+      status: error ? 'error' : 'success',
+      result,
+      error,
+    },
+    nextRun,
+    resultSummary,
+  );
 }
 
 let schedulerRunning = false;

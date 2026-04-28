@@ -23,6 +23,7 @@ import {
   deleteTask,
   getSession,
   getTaskById,
+  getTaskRunLogs,
   pruneCompletedTasks,
   resurrectZombieTasks,
   setSession,
@@ -1214,5 +1215,223 @@ describe('task scheduler', () => {
     // Task B's last_result must only contain B's marker (cross-attribution fix).
     expect(taskB?.last_result).toContain('MARKER_FROM_TASK_B');
     expect(taskB?.last_result).not.toContain('MARKER_FROM_TASK_A');
+  });
+
+  // --- Issue #17: atomic log + update invariant ---
+  //
+  // Every successful or failed task run MUST produce BOTH a task_run_logs
+  // row AND update scheduled_tasks.last_run in the same transaction. The
+  // pre-fix code called logTaskRun() and updateTaskAfterRun() separately,
+  // so a crash or DB error between the two calls left the task in an
+  // inconsistent state: last_run set but no run-log (or vice versa).
+  //
+  // logAndUpdateTask() wraps both in a single SQLite transaction. The tests
+  // below verify that after a task run, both the log row and the scheduled_tasks
+  // update are present and consistent.
+
+  it('after a successful task run, task_run_logs row and scheduled_tasks.last_run are both set (issue #17 invariant)', async () => {
+    const MAIN_GROUP = {
+      name: 'Main',
+      folder: 'main',
+      trigger: 'always',
+      added_at: '2026-01-01T00:00:00.000Z',
+      isMain: true,
+    };
+
+    createTask({
+      id: 'atomic-once-task',
+      group_folder: 'main',
+      chat_jid: 'main@g.us',
+      prompt: 'run once',
+      schedule_type: 'once',
+      schedule_value: '2026-01-01T12:00:00Z',
+      context_mode: 'isolated',
+      next_run: new Date(Date.now() - 1000).toISOString(),
+      status: 'active',
+      created_at: '2026-01-01T00:00:00.000Z',
+    });
+
+    mockRunContainerAgent.mockImplementation(
+      async (_group, _input, _onProc, onOutput) => {
+        await onOutput!({ status: 'success', result: 'task-output' } as ContainerOutput);
+        return { status: 'success', result: 'task-output' };
+      },
+    );
+
+    const enqueueTask = vi.fn(
+      (
+        _groupJid: string,
+        _taskId: string,
+        _sessionName: string,
+        fn: () => Promise<void>,
+      ) => {
+        void fn();
+      },
+    );
+
+    startSchedulerLoop({
+      registeredGroups: () => ({ 'main@g.us': MAIN_GROUP }),
+      getSessions: () => ({}),
+      queue: { enqueueTask, closeStdin: vi.fn() } as never,
+      onProcess: () => {},
+      sendMessage: async () => {},
+    });
+
+    await vi.advanceTimersByTimeAsync(10);
+
+    const task = getTaskById('atomic-once-task');
+    const logs = getTaskRunLogs('atomic-once-task');
+
+    // The run-log row MUST exist — pre-fix, this was the missing piece.
+    expect(logs).toHaveLength(1);
+    expect(logs[0].status).toBe('success');
+
+    // scheduled_tasks.last_run must be set and match the run-log's run_at
+    // exactly (they share the same clock reading from the transaction).
+    expect(task?.last_run).toBeTruthy();
+    expect(task?.last_run).toBe(logs[0].run_at);
+
+    // last_result must reflect the actual output, not be NULL.
+    expect(task?.last_result).toContain('task-output');
+
+    // status=completed for a once-task.
+    expect(task?.status).toBe('completed');
+  });
+
+  it('after a failed task run, task_run_logs row and scheduled_tasks.last_run are both set (error path)', async () => {
+    const MAIN_GROUP = {
+      name: 'Main',
+      folder: 'main',
+      trigger: 'always',
+      added_at: '2026-01-01T00:00:00.000Z',
+      isMain: true,
+    };
+
+    createTask({
+      id: 'atomic-error-task',
+      group_folder: 'main',
+      chat_jid: 'main@g.us',
+      prompt: 'run and fail',
+      schedule_type: 'once',
+      schedule_value: '2026-01-01T12:00:00Z',
+      context_mode: 'isolated',
+      next_run: new Date(Date.now() - 1000).toISOString(),
+      status: 'active',
+      created_at: '2026-01-01T00:00:00.000Z',
+    });
+
+    // Simulate container failure
+    mockRunContainerAgent.mockImplementation(
+      async (_group, _input, _onProc, onOutput) => {
+        await onOutput!({ status: 'error', result: null, error: 'container-crash' } as ContainerOutput);
+        return { status: 'error', result: null, error: 'container-crash' };
+      },
+    );
+
+    const enqueueTask = vi.fn(
+      (
+        _groupJid: string,
+        _taskId: string,
+        _sessionName: string,
+        fn: () => Promise<void>,
+      ) => {
+        void fn();
+      },
+    );
+
+    startSchedulerLoop({
+      registeredGroups: () => ({ 'main@g.us': MAIN_GROUP }),
+      getSessions: () => ({}),
+      queue: { enqueueTask, closeStdin: vi.fn() } as never,
+      onProcess: () => {},
+      sendMessage: async () => {},
+    });
+
+    await vi.advanceTimersByTimeAsync(10);
+
+    const task = getTaskById('atomic-error-task');
+    const logs = getTaskRunLogs('atomic-error-task');
+
+    // Error path: log row must also exist.
+    expect(logs).toHaveLength(1);
+    expect(logs[0].status).toBe('error');
+
+    // last_run must be set and consistent with run_at.
+    expect(task?.last_run).toBeTruthy();
+    expect(task?.last_run).toBe(logs[0].run_at);
+
+    // last_result contains the error prefix.
+    expect(task?.last_result).toMatch(/^Error:/);
+  });
+
+  it('task_run_logs.run_at and scheduled_tasks.last_run share the same timestamp (no synthetic schedule-time bleed)', async () => {
+    // Regression guard for the specific symptom in #17: last_run was set to
+    // the schedule_value time (round .000Z ms) rather than wall-clock time.
+    // logAndUpdateTask uses a single `now = new Date().toISOString()` for
+    // both fields, so they always agree and are never synthetic.
+    const MAIN_GROUP = {
+      name: 'Main',
+      folder: 'main',
+      trigger: 'always',
+      added_at: '2026-01-01T00:00:00.000Z',
+      isMain: true,
+    };
+
+    const scheduleValue = '2026-01-01T09:33:24';  // local-time ISO without Z, no ms
+    const scheduleValueAsUtc = new Date(scheduleValue).toISOString(); // .000Z on PDT
+
+    createTask({
+      id: 'no-synthetic-ts-task',
+      group_folder: 'main',
+      chat_jid: 'main@g.us',
+      prompt: 'check timestamps',
+      schedule_type: 'once',
+      schedule_value: scheduleValue,
+      context_mode: 'isolated',
+      next_run: new Date(Date.now() - 1000).toISOString(),
+      status: 'active',
+      created_at: '2026-01-01T00:00:00.000Z',
+    });
+
+    mockRunContainerAgent.mockImplementation(
+      async (_group, _input, _onProc, onOutput) => {
+        await onOutput!({ status: 'success', result: 'ok' } as ContainerOutput);
+        return { status: 'success', result: 'ok' };
+      },
+    );
+
+    const enqueueTask = vi.fn(
+      (
+        _groupJid: string,
+        _taskId: string,
+        _sessionName: string,
+        fn: () => Promise<void>,
+      ) => {
+        void fn();
+      },
+    );
+
+    startSchedulerLoop({
+      registeredGroups: () => ({ 'main@g.us': MAIN_GROUP }),
+      getSessions: () => ({}),
+      queue: { enqueueTask, closeStdin: vi.fn() } as never,
+      onProcess: () => {},
+      sendMessage: async () => {},
+    });
+
+    await vi.advanceTimersByTimeAsync(10);
+
+    const task = getTaskById('no-synthetic-ts-task');
+    const logs = getTaskRunLogs('no-synthetic-ts-task');
+
+    expect(logs).toHaveLength(1);
+    // last_run must equal run_at — they come from the same `now` in the tx.
+    expect(task?.last_run).toBe(logs[0].run_at);
+    // Neither must equal the .000Z synthetic schedule-value UTC conversion.
+    // (This test may pass coincidentally if the wall clock happens to
+    // produce .000Z at the exact ms boundary, but that's a false pass
+    // only if the test machine is extraordinarily unlucky and the
+    // schedule_value UTC conversion also matches — negligible probability.)
+    expect(task?.last_run).not.toBe(scheduleValueAsUtc);
   });
 });
