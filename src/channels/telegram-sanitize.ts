@@ -79,7 +79,6 @@ const TELEGRAM_ALLOWED_TAGS = new Set<string>([
   'tg-spoiler',
   'span',
   'tg-emoji',
-  'br',
 ]);
 
 export function sanitizeTelegramHtml(text: string): string {

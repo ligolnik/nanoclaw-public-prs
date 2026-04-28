@@ -256,4 +256,28 @@ describe('sanitizeTelegramHtml — unknown tag escape (Phase 1b allowlist)', () 
       '&lt;some_field&gt;x&lt;/some_field&gt;',
     );
   });
+
+  it('self-closing unknown tag is escaped', () => {
+    expect(sanitizeTelegramHtml('before <foo/> after')).toBe(
+      'before &lt;foo/&gt; after',
+    );
+  });
+
+  it('attribute-bearing unknown tag is escaped', () => {
+    expect(sanitizeTelegramHtml('<foo bar="x">y</foo>')).toBe(
+      '&lt;foo bar=&quot;x&quot;&gt;y&lt;/foo&gt;',
+    );
+  });
+
+  it('mixed-case allowed tag passes through (case-insensitive allowlist)', () => {
+    const input = '<B>bold</B>';
+    expect(sanitizeTelegramHtml(input)).toBe(input);
+  });
+
+  it('unknown tag inside fenced code block is preserved verbatim, not escaped', () => {
+    const input = '```\n<tool_use_error>blocked</tool_use_error>\n```';
+    expect(sanitizeTelegramHtml(input)).toBe(
+      '<pre>&lt;tool_use_error&gt;blocked&lt;/tool_use_error&gt;</pre>',
+    );
+  });
 });
