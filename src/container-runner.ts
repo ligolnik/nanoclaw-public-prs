@@ -224,7 +224,28 @@ export function buildSecretEnvFile(
  * and does not support `effort: 'max'` well. The current runner is set up
  * for 4.7's expectations.
  */
-const AGENT_MODEL = process.env.AGENT_MODEL || 'claude-sonnet-4-6[1m]';
+// Light validation: trim whitespace (so `AGENT_MODEL="  "` falls back to
+// the default rather than passing two spaces to the SDK) and warn on
+// values that don't look like a Claude model ID. We don't enumerate a
+// whitelist because the SDK accepts both aliases (`opus`, `sonnet[1m]`)
+// and full IDs (`claude-opus-4-7[1m]`), the set churns with each model
+// release, and a missed model would block legit upgrades. The warn
+// surfaces typos at startup instead of at first `query()` call deep in
+// runtime.
+const KNOWN_MODEL_PREFIX_RE = /^(claude|opus|sonnet|haiku)/i;
+function resolveAgentModel(raw: string | undefined): string {
+  const fallback = 'claude-sonnet-4-6[1m]';
+  const trimmed = raw?.trim();
+  if (!trimmed) return fallback;
+  if (!KNOWN_MODEL_PREFIX_RE.test(trimmed)) {
+    logger.warn(
+      { agentModel: trimmed, fallback },
+      'AGENT_MODEL does not look like a Claude model ID — will pass to SDK as-is, but check for a typo. Expected forms: full ID like "claude-opus-4-7[1m]" or alias like "opus" / "sonnet[1m]".',
+    );
+  }
+  return trimmed;
+}
+const AGENT_MODEL = resolveAgentModel(process.env.AGENT_MODEL);
 
 /**
  * Effort level the agent-runner passes to the SDK's `query()` call.
@@ -1372,7 +1393,10 @@ function buildContainerArgs(
   // the agent from issuing raw HTTP requests on user instruction in
   // untrusted contexts, so the MCP-tool surface is the practical
   // contract for what an untrusted container can reach.
-  const oneCliEnv = readEnvFile(['ONECLI_AGENT_TOKEN', 'ONECLI_ENABLE_SMARTTHINGS']);
+  const oneCliEnv = readEnvFile([
+    'ONECLI_AGENT_TOKEN',
+    'ONECLI_ENABLE_SMARTTHINGS',
+  ]);
   const oneCliAgentToken =
     process.env.ONECLI_AGENT_TOKEN || oneCliEnv.ONECLI_AGENT_TOKEN;
   // SmartThings is gated separately because device write tools have a
