@@ -1353,6 +1353,59 @@ function buildContainerArgs(
     args.push('-e', 'CLAUDE_CODE_OAUTH_TOKEN=placeholder');
   }
 
+  // OneCLI gateway access — optional. When the operator runs an OneCLI
+  // gateway on the host (provides transparent OAuth injection for
+  // third-party APIs like Google Calendar, Gmail, SmartThings), the
+  // agent's HTTPS calls route through it via HTTPS_PROXY. The agent
+  // never sees the actual OAuth tokens; the gateway substitutes them
+  // at request time based on host-pattern matching on its side.
+  //
+  // Gates on ONECLI_AGENT_TOKEN being set AND the gateway CA cert
+  // existing at ~/.onecli/gateway-ca.pem. Both must hold — the proxy
+  // requires per-container token auth, and the CA cert lets the
+  // container trust the gateway's MITM TLS terminator. If either is
+  // missing this block is skipped and containers run without
+  // HTTPS_PROXY, exactly as they do today.
+  //
+  // The agent-side OneCLI MCP server (separate PR, container-side)
+  // detects HTTPS_PROXY and registers its tools when present. So
+  // operators who don't run OneCLI see no behavior change either
+  // here or in the container.
+  const oneCliEnv = readEnvFile(['ONECLI_AGENT_TOKEN']);
+  const oneCliAgentToken =
+    process.env.ONECLI_AGENT_TOKEN || oneCliEnv.ONECLI_AGENT_TOKEN;
+  const oneCliCa = `${process.env.HOME || os.homedir()}/.onecli/gateway-ca.pem`;
+  const trustTier: 'main' | 'trusted' | 'untrusted' = isMain
+    ? 'main'
+    : group.containerConfig?.trusted === true
+      ? 'trusted'
+      : 'untrusted';
+  if (oneCliAgentToken && fs.existsSync(oneCliCa)) {
+    args.push('-e', `NANOCLAW_TRUST_TIER=${trustTier}`);
+    const proxyUrl = `http://x:${oneCliAgentToken}@${CONTAINER_HOST_GATEWAY}:10255`;
+    args.push('-e', `HTTPS_PROXY=${proxyUrl}`);
+    args.push('-e', `HTTP_PROXY=${proxyUrl}`);
+    args.push('-e', `https_proxy=${proxyUrl}`);
+    args.push('-e', `http_proxy=${proxyUrl}`);
+    // Skip proxy for the local Anthropic credential proxy and any
+    // localhost service. Hostname-only entries; port-suffix forms
+    // aren't reliably honored by Node's undici EnvHttpProxyAgent.
+    // api.anthropic.com is INTENTIONALLY NOT excluded so tools that
+    // use the anthropic SDK directly (third-party scripts) can route
+    // through OneCLI for key injection. The Claude Agent SDK is
+    // unaffected because it uses ANTHROPIC_BASE_URL pointing at the
+    // local credential proxy and goes through its own OAuth path.
+    args.push('-e', `NO_PROXY=${CONTAINER_HOST_GATEWAY},127.0.0.1,localhost`);
+    args.push('-e', `no_proxy=${CONTAINER_HOST_GATEWAY},127.0.0.1,localhost`);
+    // Mount the gateway CA so curl, Node's https, Python requests,
+    // and the rest of the stack trust the gateway's terminator.
+    args.push('-e', 'NODE_EXTRA_CA_CERTS=/etc/onecli/ca.pem');
+    args.push('-e', 'SSL_CERT_FILE=/etc/onecli/ca.pem');
+    args.push('-e', 'CURL_CA_BUNDLE=/etc/onecli/ca.pem');
+    args.push('-e', 'REQUESTS_CA_BUNDLE=/etc/onecli/ca.pem');
+    args.push('-v', `${oneCliCa}:/etc/onecli/ca.pem:ro`);
+  }
+
   // Runtime-specific args for host gateway resolution
   args.push(...hostGatewayArgs());
 
