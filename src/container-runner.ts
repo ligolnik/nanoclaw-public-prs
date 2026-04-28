@@ -1380,8 +1380,27 @@ function buildContainerArgs(
     : group.containerConfig?.trusted === true
       ? 'trusted'
       : 'untrusted';
+  // SmartThings is gated separately because device write tools have a
+  // higher risk profile than read-mostly Calendar/Gmail. Operators
+  // running OneCLI for gcal/gmail shouldn't get 8 physical-device write
+  // tools as dead code behind the same gate. Set
+  // ONECLI_ENABLE_SMARTTHINGS=1 in the host env / .env to opt in.
+  const oneCliSmartThingsEnabled =
+    process.env.ONECLI_ENABLE_SMARTTHINGS === '1' ||
+    readEnvFile(['ONECLI_ENABLE_SMARTTHINGS']).ONECLI_ENABLE_SMARTTHINGS ===
+      '1';
   if (oneCliAgentToken && fs.existsSync(oneCliCa)) {
     args.push('-e', `NANOCLAW_TRUST_TIER=${trustTier}`);
+    // Dedicated activation flag for the agent-side OneCLI MCP server.
+    // The server gates registration on NANOCLAW_ONECLI_ENABLED=1
+    // rather than on HTTPS_PROXY presence, so that operators behind a
+    // corporate proxy / mitmproxy don't accidentally activate the MCP
+    // tools without an actual OneCLI gateway. Setting this here pairs
+    // the activation with the proxy injection — both flip together.
+    args.push('-e', 'NANOCLAW_ONECLI_ENABLED=1');
+    if (oneCliSmartThingsEnabled) {
+      args.push('-e', 'NANOCLAW_ONECLI_ENABLE_SMARTTHINGS=1');
+    }
     const proxyUrl = `http://x:${oneCliAgentToken}@${CONTAINER_HOST_GATEWAY}:10255`;
     args.push('-e', `HTTPS_PROXY=${proxyUrl}`);
     args.push('-e', `HTTP_PROXY=${proxyUrl}`);
