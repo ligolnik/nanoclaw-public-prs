@@ -11,6 +11,7 @@ import {
 import { stopContainer } from './container-runtime.js';
 import { MAINTENANCE_SESSION_NAME } from './group-queue.js';
 import {
+  deleteTask,
   getAllTasks,
   getDormantRecurringTasks,
   getDueTasks,
@@ -266,18 +267,27 @@ async function runTask(
   );
 
   if (!group) {
-    logger.error(
+    // The group was deregistered (or its registry row was manually removed)
+    // between this task being scheduled and the dispatch tick that picked it
+    // up. There is no live container to talk to and no future tick that
+    // could change that — the task is permanently orphaned. Self-heal by
+    // deleting it instead of erroring every poll interval forever (#52).
+    //
+    // Auto-deletion subsumes Option A's manual cleanup migration: any
+    // pre-existing orphans (e.g. heartbeat-* rows whose group was removed
+    // before this fix landed) are dropped on the next dispatch tick. The
+    // sibling cleanup at deregister-time (when one exists) makes this code
+    // path the second line of defence rather than the first.
+    //
+    // Logged at debug, not error: a missing group here is expected during
+    // the brief window between registry removal and orphan cleanup, so it
+    // is not actionable. If it ever signals something genuinely wrong, the
+    // upstream registry-removal path is where the bug lives, not here.
+    deleteTask(task.id);
+    logger.debug(
       { taskId: task.id, groupFolder: task.group_folder },
-      'Group not found for task',
+      'Deleted orphaned task whose group is no longer registered',
     );
-    logTaskRun({
-      task_id: task.id,
-      run_at: new Date().toISOString(),
-      duration_ms: Date.now() - startTime,
-      status: 'error',
-      result: null,
-      error: `Group not found: ${task.group_folder}`,
-    });
     return;
   }
 

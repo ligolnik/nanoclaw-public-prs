@@ -101,6 +101,77 @@ describe('task scheduler', () => {
     expect(task?.status).toBe('paused');
   });
 
+  it('deletes orphaned task whose group is no longer registered (closes #52)', async () => {
+    // Repro for #52: a `heartbeat-*` recurring task whose group was
+    // deregistered (or whose `registered_groups` row was removed manually)
+    // would dispatch every poll interval forever, the orchestrator would
+    // ERROR-log "Group not found for task", and the row would never go
+    // away. Post-fix: the dispatch handler self-heals by deleting the task
+    // and emits a debug log.
+    const orphanId = 'heartbeat-telegram_iff-lom-bot-test';
+    createTask({
+      id: orphanId,
+      group_folder: 'telegram_iff-lom-bot-test',
+      chat_jid: 'telegram_iff-lom-bot-test@g.us',
+      prompt: 'heartbeat',
+      schedule_type: 'interval',
+      schedule_value: '900000', // 15 min
+      context_mode: 'group',
+      next_run: new Date(Date.now() - 60_000).toISOString(),
+      status: 'active',
+      created_at: '2026-02-22T00:00:00.000Z',
+    });
+
+    // Sanity: a task on a still-registered group must NOT be touched.
+    createTask({
+      id: 'live-task',
+      group_folder: 'main',
+      chat_jid: 'main@g.us',
+      prompt: 'work',
+      schedule_type: 'interval',
+      schedule_value: '900000',
+      context_mode: 'group',
+      next_run: new Date(Date.now() + 600_000).toISOString(),
+      status: 'active',
+      created_at: '2026-02-22T00:00:00.000Z',
+    });
+
+    const errorSpy = vi.spyOn(logger, 'error');
+
+    const enqueueTask = vi.fn(
+      (
+        _groupJid: string,
+        _taskId: string,
+        _sessionName: string,
+        fn: () => Promise<void>,
+      ) => {
+        void fn();
+      },
+    );
+
+    // Empty registry — orphanId's group is missing. The live-task's group
+    // is also missing here, but the live-task is not due yet so the
+    // dispatch handler never sees it.
+    startSchedulerLoop({
+      registeredGroups: () => ({}),
+      getSessions: () => ({}),
+      queue: { enqueueTask } as any,
+      onProcess: () => {},
+      sendMessage: async () => {},
+    });
+
+    await vi.advanceTimersByTimeAsync(10);
+
+    // The orphan was deleted — and ONLY the orphan.
+    expect(getTaskById(orphanId)).toBeUndefined();
+    expect(getTaskById('live-task')).toBeDefined();
+    // No ERROR-log noise for the expected deregistered-group case.
+    const errorMessages = errorSpy.mock.calls.map((c) => c[1]);
+    expect(errorMessages).not.toContain('Group not found for task');
+    // Container was never spawned for the orphan.
+    expect(mockRunContainerAgent).not.toHaveBeenCalled();
+  });
+
   it('computeNextRun anchors interval tasks to scheduled time to prevent drift', () => {
     const scheduledTime = new Date(Date.now() - 2000).toISOString(); // 2s ago
     const task = {
