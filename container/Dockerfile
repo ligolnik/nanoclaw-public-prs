@@ -73,6 +73,14 @@ RUN git config --global pack.threads 1 && \
     git config --global pack.deltaCacheSize 1m && \
     git config --global pack.windowMemory 100m
 
+# Git credential helper — uses $GITHUB_TOKEN env var at request time so
+# `git fetch/pull/push` over HTTPS works directly. The token is injected
+# via --env-file at container spawn (see SECRET_CONTAINER_VARS in the
+# orchestrator). Only main/trusted tier containers receive the token;
+# untrusted-tier containers will see this helper return empty creds and
+# get the same authentication failure they get today.
+RUN git config --system credential.helper '!f() { echo username=x-access-token; echo "password=$GITHUB_TOKEN"; }; f'
+
 
 # Run as non-root node user (uid 1000) by default.
 # The orchestrator may override with --user for non-main groups.

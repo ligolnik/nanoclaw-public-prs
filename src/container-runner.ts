@@ -106,6 +106,7 @@ const OUTPUT_END_MARKER = '---NANOCLAW_OUTPUT_END---';
  */
 export const SECRET_CONTAINER_VARS: ReadonlySet<string> = new Set([
   'COMPOSIO_API_KEY',
+  'GITHUB_TOKEN',
 ]);
 
 /**
@@ -1335,17 +1336,40 @@ function buildContainerArgs(
   args.push('-e', `TZ=${TIMEZONE}`);
 
   // Credential tiers:
-  //   Main/Trusted: Composio only (handles Gmail, Calendar, Tasks, GitHub via OAuth)
-  //   Other:        nothing (Anthropic via proxy only)
+  //   Main/Trusted: scoped GITHUB_TOKEN (PAT, no admin) so the agent can
+  //                 git fetch/pull/push over HTTPS and call the GitHub
+  //                 REST API directly. The Bearer-header rewrite that
+  //                 OneCLI does for the proxied Anthropic/Composio paths
+  //                 doesn't bridge git's HTTP-Basic auth at the connection
+  //                 level, which is why the token must be in-container
+  //                 rather than proxy-injected. The PAT is fine-grained
+  //                 and has no admin scope, so the in-container identity
+  //                 cannot bypass branch protection or repo-admin ops
+  //                 even though it matches the repo owner.
+  //   Untrusted:    nothing — never receives GITHUB_TOKEN. The credential
+  //                 helper baked into the image returns an empty password
+  //                 in that case, and git-over-HTTPS fails the same way
+  //                 it does today.
   //
-  // All other credentials (GITHUB_TOKEN, GOOGLE_*, OPENAI_*)
-  // stay on the host. Scripts that need them run host-side via IPC.
-  // Previously forwarded COMPOSIO_API_KEY; removed since this deployment
-  // uses OneCLI for third-party app auth (see OneCLI proxy block above).
-  // The env-file secret-passing infrastructure (SECRET_CONTAINER_VARS,
-  // buildSecretEnvFile) is preserved from upstream so future per-container
-  // secrets can use it without re-introducing the -e leak surface. We
-  // just have nothing to forward right now.
+  // Forwarded via the env-file mechanism (SECRET_CONTAINER_VARS +
+  // buildSecretEnvFile) so the value never appears on the docker `-e`
+  // command line where it could leak into process tables or logs.
+  // COMPOSIO_API_KEY is retained in SECRET_CONTAINER_VARS even though
+  // unused locally — preserves the upstream-merge surface.
+  const containerEnvVars: string[] = ['GITHUB_TOKEN'];
+  const secretEnv: Record<string, string> = {};
+  if (isMain || group.containerConfig?.trusted === true) {
+    for (const name of containerEnvVars) {
+      const v = process.env[name];
+      if (v && SECRET_CONTAINER_VARS.has(name)) {
+        secretEnv[name] = v;
+      }
+    }
+  }
+  const secretFile = buildSecretEnvFile(secretEnv);
+  if (secretFile) {
+    args.push(...secretFile.args);
+  }
 
   // Select which model + effort the agent-runner's SDK query() uses.
   // The runner reads `process.env.AGENT_MODEL` and `process.env.AGENT_EFFORT`
@@ -1488,7 +1512,7 @@ function buildContainerArgs(
 
   return {
     args,
-    cleanup: () => {},
+    cleanup: secretFile ? secretFile.cleanup : () => {},
   };
 }
 

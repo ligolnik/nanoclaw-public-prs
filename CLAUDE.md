@@ -23,7 +23,7 @@ Single Node.js process with skill-based channel system. Channels (WhatsApp, Tele
 
 ## Secrets / Credentials / Proxy (OneCLI)
 
-API keys, secret keys, OAuth tokens, and auth credentials are managed by the OneCLI gateway — which handles secret injection into containers at request time, so no keys or tokens are ever passed to containers directly. Run `onecli --help`.
+Most API keys, OAuth tokens, and auth credentials are managed by the OneCLI gateway — secrets are injected at request time so no value is passed to containers directly. **Exception:** main/trusted-tier containers receive `GITHUB_TOKEN` directly via the env-file mechanism (`SECRET_CONTAINER_VARS` in `src/container-runner.ts`). The token is a scoped fine-grained PAT — no admin, no branch-protection bypass — so the bot can `git push`/`pull` and call the GitHub REST API without OneCLI's HTTPS rewrite. Untrusted-tier containers receive nothing. Run `onecli --help`.
 
 ## Skills
 
