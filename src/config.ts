@@ -41,14 +41,23 @@ const HOME_DIR = process.env.HOME || os.homedir();
 // When running directly on the host (e.g., Mac), this defaults to cwd().
 export const HOST_PROJECT_ROOT = process.env.HOST_PROJECT_ROOT || PROJECT_ROOT;
 
-// In DooD, process.getuid() returns the orchestrator container's uid (1000).
-// HOST_UID/HOST_GID env vars override this with the actual host user's uid/gid.
+// Resolution order for the uid/gid that container files should be chowned to:
+//   1. HOST_UID / HOST_GID env vars — required for Docker-out-of-Docker
+//      deployments, where process.getuid() returns the orchestrator
+//      container's uid (typically 1000), not the real host user.
+//   2. process.getuid() / process.getgid() — the host process's own
+//      uid/gid. Correct for bare-metal hosts (macOS user is uid 501,
+//      not 1000), where falling back to a hardcoded 1000 makes chown
+//      misfire with EPERM (issue #44).
+//   3. The call-site `?? 1000` last-resort fallback — used only when
+//      neither an env override nor process.getuid/getgid is available
+//      (e.g. Windows, where process.getuid is undefined).
 export const HOST_UID = process.env.HOST_UID
   ? parseInt(process.env.HOST_UID, 10)
-  : undefined;
+  : process.getuid?.();
 export const HOST_GID = process.env.HOST_GID
   ? parseInt(process.env.HOST_GID, 10)
-  : undefined;
+  : process.getgid?.();
 
 // Mount security: allowlist stored OUTSIDE project root, never mounted into containers
 export const MOUNT_ALLOWLIST_PATH =
