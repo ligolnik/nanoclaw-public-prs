@@ -37,7 +37,7 @@ import { detectAuthMode } from './credential-proxy.js';
 import { onAgentLine } from './observer.js';
 import { validateAdditionalMounts } from './mount-security.js';
 import { RegisteredGroup } from './types.js';
-import { readEnvFile } from './env.js';
+import { readEnvFile, readEnvFileAll } from './env.js';
 
 /**
  * Select which tiles to install based on group trust tier.
@@ -107,6 +107,56 @@ const OUTPUT_END_MARKER = '---NANOCLAW_OUTPUT_END---';
 export const SECRET_CONTAINER_VARS: ReadonlySet<string> = new Set([
   'COMPOSIO_API_KEY',
   'GITHUB_TOKEN',
+]);
+
+/**
+ * Env vars from the host `.env` file that must NEVER be forwarded to
+ * scheduled-task containers, even for trusted/main groups. These are either:
+ *
+ * (a) Channel bot tokens — forwarding would let container scripts bypass MCP
+ *     and call the Telegram/Discord/Slack APIs directly, breaking audit trails.
+ * (b) OAuth credentials that are managed by OneCLI or the credential proxy —
+ *     they must flow through the proxy, not as raw env vars in the container.
+ * (c) Orchestrator-internal vars already forwarded separately by
+ *     `buildContainerArgs` (avoiding duplicates and accidental overrides).
+ * (d) Host-only secrets that have no meaning inside a container.
+ *
+ * This list is intentionally conservative: when in doubt, keep a var out.
+ * If a new channel or secret is added to `.env`, add it here too.
+ * Third-party API keys (GOOGLE_MAPS_API_KEY, TOMTOM_API_KEY, etc.) that
+ * script wrappers need are NOT in this list — they pass through (issue #18).
+ */
+export const BLOCKED_TASK_ENV_VARS: ReadonlySet<string> = new Set([
+  // Anthropic / SDK (already forwarded as placeholder via credential proxy)
+  'ANTHROPIC_API_KEY',
+  'ANTHROPIC_BASE_URL',
+  'ANTHROPIC_AUTH_TOKEN',
+  'CLAUDE_CODE_OAUTH_TOKEN',
+  // Channel bot tokens
+  'TELEGRAM_BOT_TOKEN',
+  'WHATSAPP_SESSION_ID',
+  'WHATSAPP_SESSION',
+  'SLACK_BOT_TOKEN',
+  'SLACK_APP_TOKEN',
+  'DISCORD_BOT_TOKEN',
+  'DISCORD_CLIENT_SECRET',
+  'GMAIL_CLIENT_ID',
+  'GMAIL_CLIENT_SECRET',
+  'GMAIL_REFRESH_TOKEN',
+  // OneCLI / credential proxy (already forwarded separately)
+  'ONECLI_AGENT_TOKEN',
+  'COMPOSIO_API_KEY',
+  // GitHub PAT — already routed via SECRET_CONTAINER_VARS env-file (PR #32);
+  // exclude here so a .env-defined value isn't double-forwarded.
+  'GITHUB_TOKEN',
+  // Nanoclaw orchestrator vars (forwarded separately or not needed in container)
+  'AGENT_MODEL',
+  'AGENT_EFFORT',
+  'TIMEZONE',
+  'TZ',
+  'HOST_UID',
+  'HOST_GID',
+  'HOST_PROJECT_ROOT',
 ]);
 
 /**
@@ -1299,6 +1349,7 @@ function buildContainerArgs(
   replyToMessageId?: string,
   chatJid?: string,
   continuationCycleId?: string,
+  isScheduledTask?: boolean,
 ): BuildContainerArgsResult {
   const args: string[] = ['run', '-i', '--rm', '--name', containerName];
 
@@ -1510,9 +1561,49 @@ function buildContainerArgs(
 
   args.push(CONTAINER_IMAGE);
 
+  // For scheduled tasks running in trusted/main containers, forward
+  // third-party API keys and other non-sensitive vars from the host .env
+  // file. Untrusted containers receive nothing — no trust, no env. Bot
+  // tokens and SDK credentials are excluded via BLOCKED_TASK_ENV_VARS so
+  // scripts can't bypass MCP or the credential proxy.
+  //
+  // Vars are forwarded via a 0600 tempfile (same mechanism as
+  // SECRET_CONTAINER_VARS) so values never appear in `docker ps` / proc
+  // command-line output. The tempfile is deleted after container spawn by
+  // the returned cleanup() callback.
+  //
+  // This resolves issue #18: without this, scripts that read API keys from
+  // os.environ silently fell back to degraded backends (OSRM instead of
+  // Google Routes, etc.) because the scheduled-task shell was non-interactive
+  // and never sourced .env through any profile hook.
+  const isTrustedOrMain = isMain || !!group.containerConfig?.trusted;
+  let taskEnvCleanup: (() => void) | null = null;
+  if (isScheduledTask && isTrustedOrMain) {
+    const taskEnv = readEnvFileAll(BLOCKED_TASK_ENV_VARS);
+    const envFile = buildSecretEnvFile(taskEnv);
+    if (envFile) {
+      args.push(...envFile.args);
+      taskEnvCleanup = envFile.cleanup;
+    }
+  }
+
+  // Compose cleanup callbacks: PR #32 wires SECRET_CONTAINER_VARS env-file
+  // (e.g. GITHUB_TOKEN) and PR #24 wires the scheduled-task .env-passthrough
+  // env-file. Both materialize 0600 tempfiles that must be unlinked after
+  // docker has consumed them. Each individual cleanup is idempotent, so we
+  // can safely call both unconditionally.
+  const secretCleanup = secretFile ? secretFile.cleanup : () => {};
+  const composedCleanup =
+    taskEnvCleanup === null
+      ? secretCleanup
+      : () => {
+          secretCleanup();
+          taskEnvCleanup!();
+        };
+
   return {
     args,
-    cleanup: secretFile ? secretFile.cleanup : () => {},
+    cleanup: composedCleanup,
   };
 }
 
@@ -1571,6 +1662,7 @@ export async function runContainerAgent(
       input.replyToMessageId,
       input.chatJid,
       input.continuationCycleId,
+      input.isScheduledTask,
     );
 
   logger.debug(
