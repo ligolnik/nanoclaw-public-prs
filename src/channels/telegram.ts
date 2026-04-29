@@ -1520,7 +1520,36 @@ export class TelegramChannel implements Channel {
   ): Promise<void> {
     if (!this.bot) return;
     const numericId = jid.replace(/^tg:/, '');
-    const msgId = parseInt(messageId, 10);
+    // Telegram's setMessageReaction only accepts integer message IDs
+    // — its own. We persist outbound bot messages with the numeric
+    // message_id Telegram returned at send time (see ipc.ts) so that
+    // a later "react to my own previous message" lookup finds an id
+    // Telegram recognises. Older rows still carry the legacy
+    // `bot-<ts>-<rand>` local id; for those we have no Telegram id
+    // to translate to, so we have to bail rather than ship the call
+    // and watch Telegram return 400. See #50.
+    let telegramMsgId: number | null = null;
+    if (/^\d+$/.test(messageId)) {
+      telegramMsgId = parseInt(messageId, 10);
+    } else {
+      // Legacy local id (bot-<ts>-<rand>) or some other non-numeric
+      // marker. Look up the row — newer bot rows are keyed on the
+      // numeric Telegram id, but some callers may still hand us the
+      // local id (or a row predating the fix). If the row's id is
+      // numeric, use that; otherwise we have no path to a real
+      // Telegram message id and we skip with a warn rather than
+      // burn an obviously-doomed API call.
+      const row = getMessageById(messageId, jid);
+      if (row && /^\d+$/.test(row.id)) {
+        telegramMsgId = parseInt(row.id, 10);
+      } else {
+        logger.warn(
+          { jid, messageId, emoji },
+          'Skipping Telegram reaction: no numeric message_id available for this row (likely a legacy bot-<ts>-<rand> id from before #50)',
+        );
+        return;
+      }
+    }
     // Telegram only allows specific emoji as reactions. Normalize
     // shortcodes (`thumbs_up`, `:thumbs_up:`) to Unicode first so
     // agents that emit Slack-style names don't silently fall back
@@ -1531,13 +1560,15 @@ export class TelegramChannel implements Channel {
     if (!reactionAllowed) {
       // Real recoverable issue — caller asked for an emoji Telegram
       // doesn't support, we're substituting 👍 silently from the
-      // user's perspective. Operators want to see this.
+      // user's perspective. Operators want to see this. Field names
+      // (`rejectedEmoji`, `originalInput`) are stable identifiers
+      // for log queries — see #51.
       logger.warn(
         {
           jid,
           messageId,
-          requested: emoji,
-          normalized,
+          rejectedEmoji: normalized,
+          originalInput: emoji,
           using: validEmoji,
         },
         'Invalid Telegram reaction emoji, falling back to 👍',
@@ -1554,7 +1585,7 @@ export class TelegramChannel implements Channel {
     try {
       await this.bot.api.raw.setMessageReaction({
         chat_id: numericId,
-        message_id: msgId,
+        message_id: telegramMsgId,
         reaction: [{ type: 'emoji', emoji: validEmoji as any }],
       });
       // Store outbound reaction so unanswered-message checks see it
@@ -1571,10 +1602,33 @@ export class TelegramChannel implements Channel {
         'Telegram reaction sent',
       );
     } catch (err) {
-      logger.error(
-        { jid, messageId, emoji: validEmoji, err },
-        'Failed to send Telegram reaction',
-      );
+      // Reactions to deleted / forbidden messages are a known,
+      // unactionable Telegram 400. Downgrade those to warn so the
+      // ERROR-level log stays meaningful — see #50 out-of-scope
+      // note. Anything else stays at error.
+      const msg = err instanceof Error ? err.message : String(err ?? '');
+      // Telegram surfaces this as either "message to react to not found"
+      // (Bot API string) or "message to be replied not found" / similar
+      // when the bot has been kicked / the chat is gone. Treat known
+      // unactionable 400s as warn so the ERROR-level log stays
+      // meaningful — see #50 out-of-scope note.
+      const isKnownTransient =
+        /message to react.*not found/i.test(msg) ||
+        /message to be replied not found/i.test(msg) ||
+        /MESSAGE_ID_INVALID/i.test(msg) ||
+        /chat not found/i.test(msg) ||
+        /bot was blocked/i.test(msg);
+      if (isKnownTransient) {
+        logger.warn(
+          { jid, messageId, emoji: validEmoji, err: msg },
+          'Telegram reaction skipped (target message gone or forbidden)',
+        );
+      } else {
+        logger.error(
+          { jid, messageId, emoji: validEmoji, err },
+          'Failed to send Telegram reaction',
+        );
+      }
     }
   }
 

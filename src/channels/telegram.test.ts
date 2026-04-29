@@ -39,9 +39,14 @@ vi.mock('../logger.js', () => ({
 // reply_to) so existing tests keep their semantics; individual
 // cross-chat tests below override per-call.
 const messageExistsInDifferentChatMock = vi.hoisted(() => vi.fn(() => false));
+// `getMessageById` is consulted by `sendReaction` to translate legacy
+// `bot-<ts>-<rand>` ids to the Telegram numeric message_id stored on
+// the row. Hoisted so individual reaction tests can stub a row. See
+// #50.
+const getMessageByIdMock = vi.hoisted(() => vi.fn(() => null));
 vi.mock('../db.js', () => ({
   getLatestMessage: vi.fn(() => null),
-  getMessageById: vi.fn(() => null),
+  getMessageById: getMessageByIdMock,
   messageExistsInDifferentChat: messageExistsInDifferentChatMock,
   storeReaction: vi.fn(),
 }));
@@ -122,6 +127,7 @@ import {
   TelegramChannelOpts,
   sendPoolMessage,
 } from './telegram.js';
+import { logger } from '../logger.js';
 
 // --- Test helpers ---
 
@@ -1284,6 +1290,130 @@ describe('TelegramChannel', () => {
     it('has name "telegram"', () => {
       const channel = new TelegramChannel('test-token', createTestOpts());
       expect(channel.name).toBe('telegram');
+    });
+  });
+
+  // --- sendReaction (#50, #51) ---
+
+  describe('sendReaction', () => {
+    it('passes the numeric Telegram message_id straight through when the caller already has it', async () => {
+      const channel = new TelegramChannel('test-token', createTestOpts());
+      await channel.connect();
+      await channel.sendReaction('tg:100200300', '485', '👍');
+      expect(currentBot().api.raw.setMessageReaction).toHaveBeenCalledWith(
+        expect.objectContaining({
+          chat_id: '100200300',
+          message_id: 485,
+          reaction: [{ type: 'emoji', emoji: '👍' }],
+        }),
+      );
+    });
+
+    it('translates a legacy bot-<ts>-<rand> id to the numeric Telegram id stored on the row (#50)', async () => {
+      // Newer bot rows are keyed on the numeric Telegram id (see ipc.ts /
+      // index.ts). When sendReaction receives a legacy local id we look
+      // up the row and reuse its (now-numeric) primary key.
+      getMessageByIdMock.mockReturnValueOnce({
+        id: '777',
+        chat_jid: 'tg:100200300',
+        sender: 'Andy',
+        sender_name: 'Andy',
+        content: 'hello',
+        timestamp: '2026-04-29T00:00:00.000Z',
+        is_from_me: true,
+      } as any);
+      const channel = new TelegramChannel('test-token', createTestOpts());
+      await channel.connect();
+      await channel.sendReaction(
+        'tg:100200300',
+        'bot-1777015856617-a7smw',
+        '👍',
+      );
+      expect(getMessageByIdMock).toHaveBeenCalledWith(
+        'bot-1777015856617-a7smw',
+        'tg:100200300',
+      );
+      expect(currentBot().api.raw.setMessageReaction).toHaveBeenCalledWith(
+        expect.objectContaining({
+          chat_id: '100200300',
+          message_id: 777,
+          reaction: [{ type: 'emoji', emoji: '👍' }],
+        }),
+      );
+    });
+
+    it('skips the Telegram call (with WARN log) when a bot-<ts>-<rand> id has no row to translate against (#50)', async () => {
+      // Pre-fix this case shipped the local id straight to Telegram, which
+      // returned a 400 and logged at ERROR — 145 entries / 12h. Now we
+      // skip with a warn that names the cause.
+      getMessageByIdMock.mockReturnValueOnce(null);
+      const channel = new TelegramChannel('test-token', createTestOpts());
+      await channel.connect();
+      await channel.sendReaction(
+        'tg:100200300',
+        'bot-1777015856617-a7smw',
+        '👍',
+      );
+      expect(currentBot().api.raw.setMessageReaction).not.toHaveBeenCalled();
+      expect(logger.warn).toHaveBeenCalledWith(
+        expect.objectContaining({
+          jid: 'tg:100200300',
+          messageId: 'bot-1777015856617-a7smw',
+        }),
+        expect.stringContaining('Skipping Telegram reaction'),
+      );
+    });
+
+    it('captures rejected emoji and original input in the WARN payload when normalization fails (#51)', async () => {
+      const channel = new TelegramChannel('test-token', createTestOpts());
+      await channel.connect();
+      // `:not_a_real_emoji:` will normalize-pass through (no shortcode
+      // entry), then trip the TELEGRAM_ALLOWED_REACTIONS gate. The
+      // post-fix log payload must carry both the rejected normalized
+      // form and the original input — pre-fix the message body was a
+      // bare string, so operators couldn't see what to fix.
+      await channel.sendReaction('tg:100200300', '485', ':not_a_real_emoji:');
+      expect(logger.warn).toHaveBeenCalledWith(
+        expect.objectContaining({
+          rejectedEmoji: expect.any(String),
+          originalInput: ':not_a_real_emoji:',
+          using: '👍',
+        }),
+        'Invalid Telegram reaction emoji, falling back to 👍',
+      );
+      // Reaction still gets shipped with the 👍 fallback.
+      expect(currentBot().api.raw.setMessageReaction).toHaveBeenCalledWith(
+        expect.objectContaining({
+          reaction: [{ type: 'emoji', emoji: '👍' }],
+        }),
+      );
+    });
+
+    it('downgrades known-transient reaction failures (deleted message etc.) to WARN (#50 out-of-scope follow-up)', async () => {
+      const channel = new TelegramChannel('test-token', createTestOpts());
+      await channel.connect();
+      currentBot().api.raw.setMessageReaction.mockRejectedValueOnce(
+        new Error('Bad Request: message to react to not found'),
+      );
+      await channel.sendReaction('tg:100200300', '485', '👍');
+      expect(logger.warn).toHaveBeenCalledWith(
+        expect.objectContaining({ jid: 'tg:100200300', messageId: '485' }),
+        expect.stringContaining('Telegram reaction skipped'),
+      );
+      expect(logger.error).not.toHaveBeenCalled();
+    });
+
+    it('still logs at ERROR for unexpected reaction failures', async () => {
+      const channel = new TelegramChannel('test-token', createTestOpts());
+      await channel.connect();
+      currentBot().api.raw.setMessageReaction.mockRejectedValueOnce(
+        new Error('Internal Server Error'),
+      );
+      await channel.sendReaction('tg:100200300', '485', '👍');
+      expect(logger.error).toHaveBeenCalledWith(
+        expect.objectContaining({ jid: 'tg:100200300', messageId: '485' }),
+        'Failed to send Telegram reaction',
+      );
     });
   });
 });

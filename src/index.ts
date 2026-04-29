@@ -496,10 +496,23 @@ async function processGroupMessages(chatJid: string): Promise<boolean> {
         logger.info({ group: group.name }, `Agent output: ${raw.length} chars`);
         if (text) {
           const replyId = pendingReplyTo[chatJid];
-          await channel.sendMessage(chatJid, text, replyId);
-          // Store bot response in DB so heartbeat can track answered messages
+          const sentMsgId = await channel.sendMessage(chatJid, text, replyId);
+          // Store bot response in DB so heartbeat can track answered
+          // messages. Use the platform-native numeric id (from
+          // Telegram's sendMessage response) as the row's primary key
+          // when available; future reaction lookups by Telegram's
+          // own message id then find the row directly. Falls back to
+          // a synthetic local id when the channel doesn't return one
+          // (e.g. WhatsApp/Slack callers that resolve to void). See
+          // #50 for the audit.
+          const sentNumericId =
+            typeof sentMsgId === 'string' && /^\d+$/.test(sentMsgId)
+              ? sentMsgId
+              : null;
           storeMessage({
-            id: `bot-${Date.now()}-${Math.random().toString(36).slice(2, 7)}`,
+            id:
+              sentNumericId ??
+              `bot-${Date.now()}-${Math.random().toString(36).slice(2, 7)}`,
             chat_jid: chatJid,
             sender: ASSISTANT_NAME,
             sender_name: ASSISTANT_NAME,

@@ -474,6 +474,12 @@ export function startIpcWatcher(deps: IpcDeps): void {
                   (targetGroup && targetGroup.folder === sourceGroup)
                 ) {
                   let sendOk: boolean;
+                  // Lifted out of the else-branch so the storeMessage
+                  // call below can use it as the row id when the
+                  // channel surfaces the platform's native message id
+                  // (currently only the non-pool sendMessage path).
+                  // See #50.
+                  let sentMsgId: string | void = undefined;
                   if (data.sender && data.chatJid.startsWith('tg:')) {
                     sendOk = await sendPoolMessage(
                       data.chatJid,
@@ -482,7 +488,7 @@ export function startIpcWatcher(deps: IpcDeps): void {
                       sourceGroup,
                     );
                   } else {
-                    const sentMsgId = await deps.sendMessage(
+                    sentMsgId = await deps.sendMessage(
                       data.chatJid,
                       cleanText,
                       data.replyToMessageId,
@@ -503,8 +509,27 @@ export function startIpcWatcher(deps: IpcDeps): void {
                   // answered" and downstream agents that quote-reply
                   // hallucinate a thread that never existed.
                   if (sendOk) {
+                    // Prefer the platform-native numeric message id
+                    // when the channel returned one (Telegram does;
+                    // the pool path doesn't). Storing the numeric id
+                    // as the row's primary key means a later
+                    // `sendReaction` lookup by that id finds the row
+                    // directly — no translation table needed. Legacy
+                    // `bot-<ts>-<rand>` is the fallback for paths
+                    // that don't surface a numeric id, e.g.
+                    // sendPoolMessage which returns a boolean — see
+                    // #50 for the audit. is_from_me=1 +
+                    // is_bot_message=1 are still the canonical
+                    // markers; nothing in the codebase parses the id
+                    // prefix.
+                    const sentNumericId =
+                      typeof sentMsgId === 'string' && /^\d+$/.test(sentMsgId)
+                        ? sentMsgId
+                        : null;
                     storeMessage({
-                      id: `bot-${Date.now()}-${Math.random().toString(36).slice(2, 7)}`,
+                      id:
+                        sentNumericId ??
+                        `bot-${Date.now()}-${Math.random().toString(36).slice(2, 7)}`,
                       chat_jid: data.chatJid,
                       sender: data.sender || ASSISTANT_NAME,
                       sender_name: data.sender || ASSISTANT_NAME,
