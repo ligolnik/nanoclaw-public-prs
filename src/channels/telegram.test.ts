@@ -742,7 +742,10 @@ describe('TelegramChannel', () => {
       });
       await triggerMediaMessage('message:voice', ctx);
 
-      expect(noteLatestUserMessageMock).toHaveBeenCalledWith('tg:100200300', '42');
+      expect(noteLatestUserMessageMock).toHaveBeenCalledWith(
+        'tg:100200300',
+        '42',
+      );
       expect(currentBot().api.raw.setMessageReaction).toHaveBeenCalledWith(
         expect.objectContaining({
           chat_id: '100200300',

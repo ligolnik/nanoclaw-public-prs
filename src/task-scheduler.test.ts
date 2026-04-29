@@ -974,15 +974,18 @@ describe('task scheduler', () => {
     // dropped (host crash, queue shut down mid-tick), the row sits here
     // forever — pruneCompletedTasks would eventually GC it but the
     // schedule is lost. resurrect puts it back in front of the loop.
+    // next_run must be in the future relative to SQLite's real wall clock
+    // (vi.useFakeTimers controls JS Date but not SQLite datetime('now')).
+    // Use a far-future date so the test stays valid as real time advances.
     createTask({
       id: 'zombie-once',
       group_folder: 'main',
       chat_jid: 'main@g.us',
       prompt: 'should have run',
       schedule_type: 'once',
-      schedule_value: '2026-01-01T00:00:00.000Z',
+      schedule_value: '2099-01-01T00:00:00.000Z',
       context_mode: 'isolated',
-      next_run: '2026-01-01T00:00:00.000Z',
+      next_run: '2099-01-01T00:00:00.000Z',
       status: 'active',
       created_at: '2026-01-01T00:00:00.000Z',
     });
@@ -995,7 +998,7 @@ describe('task scheduler', () => {
     expect(resurrected).toEqual(['zombie-once']);
     expect(getTaskById('zombie-once')?.status).toBe('active');
     expect(getTaskById('zombie-once')?.next_run).toBe(
-      '2026-01-01T00:00:00.000Z',
+      '2099-01-01T00:00:00.000Z',
     );
   });
 
@@ -1073,7 +1076,11 @@ describe('task scheduler', () => {
 
     // Seed a prior maintenance sessionId — the pre-fix code would have passed
     // this to runContainerAgent, causing the SDK to replay the prior turn.
-    setSession('main', MAINTENANCE_SESSION_NAME, 'prior-session-must-not-be-used');
+    setSession(
+      'main',
+      MAINTENANCE_SESSION_NAME,
+      'prior-session-must-not-be-used',
+    );
 
     createTask({
       id: 'no-resume-task',
@@ -1112,7 +1119,9 @@ describe('task scheduler', () => {
 
     startSchedulerLoop({
       registeredGroups: () => ({ 'main@g.us': MAIN_GROUP }),
-      getSessions: () => ({ main: { maintenance: 'prior-session-must-not-be-used' } }),
+      getSessions: () => ({
+        main: { maintenance: 'prior-session-must-not-be-used' },
+      }),
       queue: { enqueueTask, closeStdin: vi.fn() } as never,
       onProcess: () => {},
       sendMessage: async () => {},
@@ -1129,7 +1138,9 @@ describe('task scheduler', () => {
 
     // The newSessionId returned by the container IS still stored so the
     // per-session transcript chain continues to grow.
-    expect(getSession('main', MAINTENANCE_SESSION_NAME)).toBe('new-session-from-run');
+    expect(getSession('main', MAINTENANCE_SESSION_NAME)).toBe(
+      'new-session-from-run',
+    );
   });
 
   it('two sequential context_mode=group tasks get isolated last_result values (no cross-attribution)', async () => {
@@ -1175,11 +1186,17 @@ describe('task scheduler', () => {
     // Each task returns its own distinctively-labelled result.
     mockRunContainerAgent
       .mockImplementationOnce(async (_group, _input, _onProc, onOutput) => {
-        await onOutput!({ status: 'success', result: 'MARKER_FROM_TASK_A' } as ContainerOutput);
+        await onOutput!({
+          status: 'success',
+          result: 'MARKER_FROM_TASK_A',
+        } as ContainerOutput);
         return { status: 'success', result: 'MARKER_FROM_TASK_A' };
       })
       .mockImplementationOnce(async (_group, _input, _onProc, onOutput) => {
-        await onOutput!({ status: 'success', result: 'MARKER_FROM_TASK_B' } as ContainerOutput);
+        await onOutput!({
+          status: 'success',
+          result: 'MARKER_FROM_TASK_B',
+        } as ContainerOutput);
         return { status: 'success', result: 'MARKER_FROM_TASK_B' };
       });
 
@@ -1253,7 +1270,10 @@ describe('task scheduler', () => {
 
     mockRunContainerAgent.mockImplementation(
       async (_group, _input, _onProc, onOutput) => {
-        await onOutput!({ status: 'success', result: 'task-output' } as ContainerOutput);
+        await onOutput!({
+          status: 'success',
+          result: 'task-output',
+        } as ContainerOutput);
         return { status: 'success', result: 'task-output' };
       },
     );
@@ -1323,7 +1343,11 @@ describe('task scheduler', () => {
     // Simulate container failure
     mockRunContainerAgent.mockImplementation(
       async (_group, _input, _onProc, onOutput) => {
-        await onOutput!({ status: 'error', result: null, error: 'container-crash' } as ContainerOutput);
+        await onOutput!({
+          status: 'error',
+          result: null,
+          error: 'container-crash',
+        } as ContainerOutput);
         return { status: 'error', result: null, error: 'container-crash' };
       },
     );
@@ -1377,7 +1401,7 @@ describe('task scheduler', () => {
       isMain: true,
     };
 
-    const scheduleValue = '2026-01-01T09:33:24';  // local-time ISO without Z, no ms
+    const scheduleValue = '2026-01-01T09:33:24'; // local-time ISO without Z, no ms
     const scheduleValueAsUtc = new Date(scheduleValue).toISOString(); // .000Z on PDT
 
     createTask({

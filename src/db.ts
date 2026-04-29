@@ -915,9 +915,7 @@ export function updateTaskAfterRun(
  * Used by the scheduler to surface run history and by tests to verify the
  * atomicity invariant enforced by `logAndUpdateTask` (issue #17).
  */
-export function getTaskRunLogs(
-  taskId: string,
-): Array<{
+export function getTaskRunLogs(taskId: string): Array<{
   id: number;
   task_id: string;
   run_at: string;
