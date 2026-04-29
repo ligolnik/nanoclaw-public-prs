@@ -362,7 +362,10 @@ export function startIpcWatcher(deps: IpcDeps): void {
                     // responded. Store the cleaned version — storing the
                     // raw caption would let a caption whose visible text
                     // was empty after stripping count as an "answered"
-                    // response.
+                    // response. For cross-chat sends from main, this row
+                    // lands in the TARGET chat's history (data.chatJid)
+                    // — same as send_message, so downstream agents in
+                    // the target chat see the artifact.
                     if (cleanCaption) {
                       storeMessage({
                         id: `bot-${Date.now()}-${Math.random().toString(36).slice(2, 7)}`,
@@ -386,6 +389,11 @@ export function startIpcWatcher(deps: IpcDeps): void {
                       'send_file: file not found on host',
                     );
                   }
+                } else {
+                  logger.warn(
+                    { chatJid: data.chatJid, sourceGroup },
+                    'Unauthorized IPC send_file attempt blocked',
+                  );
                 }
               } else if (
                 data.type === 'send_voice' &&
@@ -439,6 +447,11 @@ export function startIpcWatcher(deps: IpcDeps): void {
                       );
                     }
                   }
+                } else {
+                  logger.warn(
+                    { chatJid: data.chatJid, sourceGroup },
+                    'Unauthorized IPC send_voice attempt blocked',
+                  );
                 }
               } else if (data.type === 'message' && data.chatJid && data.text) {
                 // Strip <internal> tags — if nothing remains, skip silently

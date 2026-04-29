@@ -275,6 +275,24 @@ export function _closeDatabase(): void {
  * condition that the issue-156 fix guards against, without exporting the
  * module-private `db` handle.
  */
+/**
+ * @internal - for tests only.
+ *
+ * Returns ALL message rows for a chat (including bot rows), used by IPC
+ * cross-chat send tests to verify that captions / spoken text were
+ * recorded against the TARGET chat. Production code should use
+ * `getMessagesSince` / `getNewMessages` which filter out bot rows.
+ */
+export function _getAllMessagesForChat(
+  chatJid: string,
+): { id: string; content: string; is_bot_message: number }[] {
+  return db
+    .prepare(
+      `SELECT id, content, is_bot_message FROM messages WHERE chat_jid = ? ORDER BY timestamp`,
+    )
+    .all(chatJid) as { id: string; content: string; is_bot_message: number }[];
+}
+
 export function _writeRawRegisteredGroup(args: {
   jid: string;
   name: string;

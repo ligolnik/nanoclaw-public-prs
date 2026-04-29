@@ -73,7 +73,11 @@ async function runHostOperation(
     ...extra,
   });
 
-  const resultPath = path.join(IPC_DIR, 'input', `_script_result_${requestId}.json`);
+  const resultPath = path.join(
+    IPC_DIR,
+    'input',
+    `_script_result_${requestId}.json`,
+  );
   const pollMs = 500;
   const start = Date.now();
 
@@ -82,14 +86,24 @@ async function runHostOperation(
       const result = JSON.parse(fs.readFileSync(resultPath, 'utf-8'));
       fs.unlinkSync(resultPath);
       if (result.error) {
-        return { content: [{ type: 'text' as const, text: `Error: ${result.error}` }], isError: true };
+        return {
+          content: [{ type: 'text' as const, text: `Error: ${result.error}` }],
+          isError: true,
+        };
       }
-      return { content: [{ type: 'text' as const, text: result.stdout || '(no output)' }] };
+      return {
+        content: [
+          { type: 'text' as const, text: result.stdout || '(no output)' },
+        ],
+      };
     }
-    await new Promise(r => setTimeout(r, pollMs));
+    await new Promise((r) => setTimeout(r, pollMs));
   }
 
-  return { content: [{ type: 'text' as const, text: `Operation ${type} timed out` }], isError: true };
+  return {
+    content: [{ type: 'text' as const, text: `Operation ${type} timed out` }],
+    isError: true,
+  };
 }
 
 const server = new McpServer({
@@ -108,8 +122,18 @@ server.tool(
       .describe(
         'Your role/identity name (e.g. "Researcher"). When set, messages appear from a dedicated bot in Telegram.',
       ),
-    reply_to: z.string().optional().describe('Message ID to reply to (quote). Get this from the [id=...] tag in the message prompt. If omitted, the message is sent without quote-threading. For cross-chat sends (chat_jid set), only pass this if it refers to a message in the TARGET chat — Telegram message IDs are per-chat.'),
-    pin: z.boolean().optional().describe('Pin this message in the chat after sending. Use for important messages like daily briefs.'),
+    reply_to: z
+      .string()
+      .optional()
+      .describe(
+        'Message ID to reply to (quote). Get this from the [id=...] tag in the message prompt. If omitted, the message is sent without quote-threading. For cross-chat sends (chat_jid set), only pass this if it refers to a message in the TARGET chat — Telegram message IDs are per-chat.',
+      ),
+    pin: z
+      .boolean()
+      .optional()
+      .describe(
+        'Pin this message in the chat after sending. Use for important messages like daily briefs.',
+      ),
     chat_jid: z
       .string()
       .optional()
@@ -142,17 +166,42 @@ server.tool(
 
     writeIpcFile(MESSAGES_DIR, data);
 
-    return { content: [{ type: 'text' as const, text: args.pin ? 'Message sent and pinned.' : 'Message sent.' }] };
+    return {
+      content: [
+        {
+          type: 'text' as const,
+          text: args.pin ? 'Message sent and pinned.' : 'Message sent.',
+        },
+      ],
+    };
   },
 );
 
 server.tool(
   'send_file',
-  'Send a file from the workspace to the user via Telegram. The file must exist on the container filesystem. Use for generated reports, exports, or any file the user asked you to create. Trusted containers only.',
+  "Send a file from the workspace to the user via Telegram. The file must exist on the container filesystem. Use for generated reports, exports, or any file the user asked you to create. To send to a different chat (cross-chat broadcast from main), pass chat_jid — only main containers may target other chats; trusted/untrusted containers can only target their own chat regardless of what's passed (host-side authz enforces this). When chat_jid is set, do NOT pass reply_to unless you have a message ID from the TARGET chat — Telegram message IDs are per-chat.",
   {
-    filePath: z.string().describe('Absolute path to the file in the container (e.g., /workspace/group/report.csv)'),
-    caption: z.string().optional().describe('Optional caption to send with the file'),
-    reply_to: z.string().optional().describe('Message ID to reply to'),
+    filePath: z
+      .string()
+      .describe(
+        'Absolute path to the file in the container (e.g., /workspace/group/report.csv)',
+      ),
+    caption: z
+      .string()
+      .optional()
+      .describe('Optional caption to send with the file'),
+    reply_to: z
+      .string()
+      .optional()
+      .describe(
+        'Message ID to reply to (quote). For cross-chat sends (chat_jid set), only pass this if it refers to a message in the TARGET chat — Telegram message IDs are per-chat.',
+      ),
+    chat_jid: z
+      .string()
+      .optional()
+      .describe(
+        'Target chat JID for cross-chat sends (e.g., "tg:-1003869886477"). Only honored when called from a main container; other tiers always send to their own chat. The captioned send is recorded in messages.db just like normal sends.',
+      ),
   },
   async (args) => {
     // Path must live under a host-readable mount. Anything else (notably
@@ -182,14 +231,16 @@ server.tool(
 
     if (!fs.existsSync(args.filePath)) {
       return {
-        content: [{ type: 'text' as const, text: `File not found: ${args.filePath}` }],
+        content: [
+          { type: 'text' as const, text: `File not found: ${args.filePath}` },
+        ],
         isError: true,
       };
     }
 
     const data: Record<string, string | undefined> = {
       type: 'send_file',
-      chatJid,
+      chatJid: args.chat_jid || chatJid,
       filePath: args.filePath,
       caption: args.caption,
       replyToMessageId: args.reply_to,
@@ -199,25 +250,45 @@ server.tool(
 
     writeIpcFile(MESSAGES_DIR, data);
 
-    return { content: [{ type: 'text' as const, text: `File queued for sending: ${path.basename(args.filePath)}` }] };
+    return {
+      content: [
+        {
+          type: 'text' as const,
+          text: `File queued for sending: ${path.basename(args.filePath)}`,
+        },
+      ],
+    };
   },
 );
 
 server.tool(
   'send_voice',
-  'Send a voice (audio) reply to the user via Telegram. Synthesizes the text using OpenAI TTS and uploads as a Telegram voice note. Use when the user sent a voice message and would prefer voice back, or when explicitly asked to reply by voice. Keep text under ~500 chars — TTS is cheap but very long messages feel awkward as audio. Use plain prose without HTML tags or markdown.',
+  "Send a voice (audio) reply to the user via Telegram. Synthesizes the text using OpenAI TTS and uploads as a Telegram voice note. Use when the user sent a voice message and would prefer voice back, or when explicitly asked to reply by voice. Keep text under ~500 chars — TTS is cheap but very long messages feel awkward as audio. Use plain prose without HTML tags or markdown. To send to a different chat (cross-chat broadcast from main), pass chat_jid — only main containers may target other chats; trusted/untrusted containers can only target their own chat regardless of what's passed (host-side authz enforces this).",
   {
-    text: z.string().describe('The text to speak (plain prose, no HTML/markdown).'),
+    text: z
+      .string()
+      .describe('The text to speak (plain prose, no HTML/markdown).'),
     voice: z
       .enum(['alloy', 'echo', 'fable', 'onyx', 'nova', 'shimmer'])
       .optional()
       .describe('OpenAI TTS voice (default: alloy).'),
-    reply_to: z.string().optional().describe('Message ID to reply to.'),
+    reply_to: z
+      .string()
+      .optional()
+      .describe(
+        'Message ID to reply to. For cross-chat sends (chat_jid set), only pass this if it refers to a message in the TARGET chat — Telegram message IDs are per-chat.',
+      ),
+    chat_jid: z
+      .string()
+      .optional()
+      .describe(
+        'Target chat JID for cross-chat sends (e.g., "tg:-1003869886477"). Only honored when called from a main container; other tiers always send to their own chat. The spoken text is recorded in messages.db just like normal sends.',
+      ),
   },
   async (args) => {
     const data: Record<string, string | undefined> = {
       type: 'send_voice',
-      chatJid,
+      chatJid: args.chat_jid || chatJid,
       text: args.text,
       voice: args.voice || 'alloy',
       replyToMessageId: args.reply_to,
@@ -225,7 +296,9 @@ server.tool(
       timestamp: new Date().toISOString(),
     };
     writeIpcFile(MESSAGES_DIR, data);
-    return { content: [{ type: 'text' as const, text: 'Voice queued for sending.' }] };
+    return {
+      content: [{ type: 'text' as const, text: 'Voice queued for sending.' }],
+    };
   },
 );
 
@@ -233,8 +306,17 @@ server.tool(
   'react_to_message',
   'React to a message with an emoji. Use to acknowledge, approve, or express sentiment without sending a full text reply. Invalid emoji falls back to 👍.',
   {
-    messageId: z.string().optional().describe('Message ID to react to. If omitted, reacts to the most recent message.'),
-    emoji: z.string().describe('Telegram reaction emoji. 73 supported: 👍👎❤🔥🥰👏😁🤔🤯😱🤬😢🎉🤩🤮💩🙏👌🕊🤡🥱🥴😍🐳❤‍🔥🌚🌭💯🤣⚡🍌🏆💔🤨😐🍓🍾💋🖕😈😴😭🤓👻👨‍💻👀🎃🙈😇😨🤝✍🤗🫡🎅🎄☃💅🤪🗿🆒💘🙉🦄😘💊🙊😎👾🤷‍♂🤷🤷‍♀😡. Invalid falls back to 👍.'),
+    messageId: z
+      .string()
+      .optional()
+      .describe(
+        'Message ID to react to. If omitted, reacts to the most recent message.',
+      ),
+    emoji: z
+      .string()
+      .describe(
+        'Telegram reaction emoji. 73 supported: 👍👎❤🔥🥰👏😁🤔🤯😱🤬😢🎉🤩🤮💩🙏👌🕊🤡🥱🥴😍🐳❤‍🔥🌚🌭💯🤣⚡🍌🏆💔🤨😐🍓🍾💋🖕😈😴😭🤓👻👨‍💻👀🎃🙈😇😨🤝✍🤗🫡🎅🎄☃💅🤪🗿🆒💘🙉🦄😘💊🙊😎👾🤷‍♂🤷🤷‍♀😡. Invalid falls back to 👍.',
+      ),
   },
   async (args) => {
     const data: Record<string, string | undefined> = {
@@ -246,7 +328,9 @@ server.tool(
       timestamp: new Date().toISOString(),
     };
     writeIpcFile(MESSAGES_DIR, data);
-    return { content: [{ type: 'text' as const, text: `Reacted with ${args.emoji}` }] };
+    return {
+      content: [{ type: 'text' as const, text: `Reacted with ${args.emoji}` }],
+    };
   },
 );
 
@@ -649,12 +733,38 @@ Use available_groups.json to find the JID for a group. The folder name must be c
       .describe(
         'Whether messages must start with the trigger word. Default: false (respond to all messages). Set to true for busy groups with many participants where you only want the agent to respond when explicitly mentioned.',
       ),
-    trusted: z.boolean().optional().describe('Whether the group gets a trusted container (read-write filesystem, admin tiles, longer timeout). Default: false. Set true for personal/friends groups.'),
-    additionalMounts: z.array(z.object({
-      hostPath: z.string().describe('Path on the host (supports "~" expansion; does not need to be absolute).'),
-      containerPath: z.string().optional().describe('Optional mount name inside /workspace/extra/. When omitted, the host derives it from basename(hostPath).'),
-      readonly: z.boolean().optional().describe('Mount as read-only (default). Set to false to request read-write access.'),
-    })).optional().describe('Extra volume mounts for the container, passed through to the host.'),
+    trusted: z
+      .boolean()
+      .optional()
+      .describe(
+        'Whether the group gets a trusted container (read-write filesystem, admin tiles, longer timeout). Default: false. Set true for personal/friends groups.',
+      ),
+    additionalMounts: z
+      .array(
+        z.object({
+          hostPath: z
+            .string()
+            .describe(
+              'Path on the host (supports "~" expansion; does not need to be absolute).',
+            ),
+          containerPath: z
+            .string()
+            .optional()
+            .describe(
+              'Optional mount name inside /workspace/extra/. When omitted, the host derives it from basename(hostPath).',
+            ),
+          readonly: z
+            .boolean()
+            .optional()
+            .describe(
+              'Mount as read-only (default). Set to false to request read-write access.',
+            ),
+        }),
+      )
+      .optional()
+      .describe(
+        'Extra volume mounts for the container, passed through to the host.',
+      ),
   },
   async (args) => {
     if (!isMain) {
@@ -669,12 +779,15 @@ Use available_groups.json to find the JID for a group. The folder name must be c
       };
     }
 
-    const containerConfig = (args.trusted !== undefined || args.additionalMounts)
-      ? {
-          ...(args.trusted !== undefined ? { trusted: args.trusted } : {}),
-          ...(args.additionalMounts ? { additionalMounts: args.additionalMounts } : {}),
-        }
-      : undefined;
+    const containerConfig =
+      args.trusted !== undefined || args.additionalMounts
+        ? {
+            ...(args.trusted !== undefined ? { trusted: args.trusted } : {}),
+            ...(args.additionalMounts
+              ? { additionalMounts: args.additionalMounts }
+              : {}),
+          }
+        : undefined;
 
     const data = {
       type: 'register_group',
@@ -751,7 +864,10 @@ server.tool(
   'github_backup',
   'Commit and push the group backup repo to GitHub. Use for nightly backups or when important state changes. The host handles git credentials — the container just triggers it.',
   {
-    message: z.string().optional().describe('Commit message. Default: "backup: <ISO date>"'),
+    message: z
+      .string()
+      .optional()
+      .describe('Commit message. Default: "backup: <ISO date>"'),
   },
   async (args) => {
     const requestId = `${Date.now()}-${Math.random().toString(36).slice(2, 8)}`;
@@ -767,7 +883,11 @@ server.tool(
     writeIpcFile(TASKS_DIR, data);
 
     // Poll for result file
-    const resultPath = path.join(IPC_DIR, 'input', `_script_result_${requestId}.json`);
+    const resultPath = path.join(
+      IPC_DIR,
+      'input',
+      `_script_result_${requestId}.json`,
+    );
     const timeoutMs = 60_000;
     const pollMs = 500;
     const start = Date.now();
@@ -778,15 +898,19 @@ server.tool(
         fs.unlinkSync(resultPath);
         if (result.error) {
           return {
-            content: [{ type: 'text' as const, text: `Backup failed: ${result.error}` }],
+            content: [
+              { type: 'text' as const, text: `Backup failed: ${result.error}` },
+            ],
             isError: true,
           };
         }
         return {
-          content: [{ type: 'text' as const, text: result.stdout || 'Backup pushed.' }],
+          content: [
+            { type: 'text' as const, text: result.stdout || 'Backup pushed.' },
+          ],
         };
       }
-      await new Promise(r => setTimeout(r, pollMs));
+      await new Promise((r) => setTimeout(r, pollMs));
     }
 
     return {
@@ -800,13 +924,27 @@ server.tool(
   'promote_staging',
   'Promote staged skills and rules to tessl tiles. Runs the full pipeline: copy from staging, lint, git commit+push, publish to registry, install. Main group only.',
   {
-    tileName: z.string().describe('Target tile: "nanoclaw-admin", "nanoclaw-core", or "nanoclaw-untrusted"'),
-    skillName: z.string().optional().describe('Specific skill to promote. Omit for all staging items. Use "--rules-only" to promote only rules.'),
+    tileName: z
+      .string()
+      .describe(
+        'Target tile: "nanoclaw-admin", "nanoclaw-core", or "nanoclaw-untrusted"',
+      ),
+    skillName: z
+      .string()
+      .optional()
+      .describe(
+        'Specific skill to promote. Omit for all staging items. Use "--rules-only" to promote only rules.',
+      ),
   },
   async (args) => {
     if (!isMain) {
       return {
-        content: [{ type: 'text' as const, text: 'Only the main group can promote tiles.' }],
+        content: [
+          {
+            type: 'text' as const,
+            text: 'Only the main group can promote tiles.',
+          },
+        ],
         isError: true,
       };
     }
@@ -824,7 +962,11 @@ server.tool(
     writeIpcFile(TASKS_DIR, data);
 
     // Poll for result (promotion can take a while — tessl publish, git push)
-    const resultPath = path.join(IPC_DIR, 'input', `_script_result_${requestId}.json`);
+    const resultPath = path.join(
+      IPC_DIR,
+      'input',
+      `_script_result_${requestId}.json`,
+    );
     const timeoutMs = 300_000;
     const pollMs = 1000;
     const start = Date.now();
@@ -835,19 +977,31 @@ server.tool(
         fs.unlinkSync(resultPath);
         if (result.error) {
           return {
-            content: [{ type: 'text' as const, text: `Promotion failed: ${result.error}` }],
+            content: [
+              {
+                type: 'text' as const,
+                text: `Promotion failed: ${result.error}`,
+              },
+            ],
             isError: true,
           };
         }
         return {
-          content: [{ type: 'text' as const, text: result.stdout || 'Promotion complete.' }],
+          content: [
+            {
+              type: 'text' as const,
+              text: result.stdout || 'Promotion complete.',
+            },
+          ],
         };
       }
-      await new Promise(r => setTimeout(r, pollMs));
+      await new Promise((r) => setTimeout(r, pollMs));
     }
 
     return {
-      content: [{ type: 'text' as const, text: 'Promotion timed out after 5 minutes.' }],
+      content: [
+        { type: 'text' as const, text: 'Promotion timed out after 5 minutes.' },
+      ],
       isError: true,
     };
   },
