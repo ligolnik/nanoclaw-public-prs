@@ -206,7 +206,12 @@ describe('createFilteredDb (untrusted DB isolation)', () => {
   // connection (per-connection setting, not persisted like journal_mode). Without
   // it the ATTACH + CTAS reads in createFilteredDb return SQLITE_BUSY immediately
   // if the orchestrator is mid-write, which can surface a false "malformed image".
-  it('filtered DB has WAL journal mode and busy_timeout set', () => {
+  //
+  // Regression guard for #43 — journal_mode must be DELETE (not WAL). The filtered
+  // copy is mounted read-only (:ro) into untrusted containers; WAL requires
+  // writable -wal/-shm sidecars even for read-only opens, so under :ro any reader
+  // that opens the DB read-write fails with "unable to open database file".
+  it('filtered DB has DELETE journal mode and busy_timeout set', () => {
     seedMessagesDb();
     const filtered = createFilteredDb('chatA@g.us', 'folder-wal-check');
     expect(filtered).not.toBe(null);
@@ -215,7 +220,7 @@ describe('createFilteredDb (untrusted DB isolation)', () => {
       const journalMode = (
         db.pragma('journal_mode') as Array<{ journal_mode: string }>
       )[0].journal_mode;
-      expect(journalMode).toBe('wal');
+      expect(journalMode).toBe('delete');
 
       const busyTimeout = (
         db.pragma('busy_timeout') as Array<{ timeout: number }>

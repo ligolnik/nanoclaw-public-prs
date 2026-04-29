@@ -351,9 +351,16 @@ export function createFilteredDb(
   // setting, not a database-level property. Without it the ATTACH + CTAS
   // reads below would return SQLITE_BUSY immediately if the orchestrator is
   // mid-write, which can cause a transient "malformed image" failure.
-  // journal_mode and synchronous are already WAL-persistent for the src DB;
-  // we set them on dst too so the filtered copy is also WAL from birth.
-  dst.pragma('journal_mode = WAL');
+  //
+  // journal_mode is DELETE (the SQLite default) — NOT WAL. This filtered
+  // copy is a one-shot snapshot mounted read-only into untrusted containers
+  // (see :ro mount in spawnContainer). WAL requires writable -wal/-shm
+  // sidecar files even for read-only opens, so under a :ro mount any reader
+  // that opens the DB read-write (e.g. Python sqlite3.connect() default)
+  // fails with "unable to open database file". Single reader, no writers,
+  // no concurrency — DELETE is the right mode here. The orchestrator's
+  // main store/messages.db is a separate file and stays WAL.
+  dst.pragma('journal_mode = DELETE');
   dst.pragma('synchronous = NORMAL');
   dst.pragma('busy_timeout = 5000');
   try {
