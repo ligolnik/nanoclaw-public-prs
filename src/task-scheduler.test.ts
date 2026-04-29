@@ -974,9 +974,11 @@ describe('task scheduler', () => {
     // dropped (host crash, queue shut down mid-tick), the row sits here
     // forever — pruneCompletedTasks would eventually GC it but the
     // schedule is lost. resurrect puts it back in front of the loop.
-    // next_run must be in the future relative to SQLite's real wall clock
-    // (vi.useFakeTimers controls JS Date but not SQLite datetime('now')).
-    // Use a far-future date so the test stays valid as real time advances.
+    // next_run must be in the future relative to wall clock: resurrect
+    // only revives tasks whose schedule hasn't already lapsed (the
+    // `next_run > datetime('now')` gate in `resurrectZombieTasks`),
+    // since stale-past tasks are intent-expired. Use a far-future
+    // sentinel so the fixture stays valid across calendar drift.
     createTask({
       id: 'zombie-once',
       group_folder: 'main',
@@ -1457,5 +1459,236 @@ describe('task scheduler', () => {
     // only if the test machine is extraordinarily unlucky and the
     // schedule_value UTC conversion also matches — negligible probability.)
     expect(task?.last_run).not.toBe(scheduleValueAsUtc);
+  });
+
+  // --- Gate-script failure reclassification (#26 / Fix B) ---
+  //
+  // Heartbeats and other script-gated tasks run a precheck script
+  // before waking the agent. When the script (or its underlying
+  // `check-unanswered.py`) hits a hard failure — e.g. the untrusted
+  // container losing read access to `/workspace/store/messages.db` —
+  // the agent dutifully wraps the failure note in `<internal>` tags
+  // and the container still reports `status: 'success'`. Pre-fix:
+  // every such run wrote `task_run_logs.status = 'success'`, hiding
+  // 96 wasted wake-ups/day on `heartbeat-telegram_old-wtf` and lying
+  // to "show me broken tasks" queries. Post-fix: the orchestrator
+  // pattern-matches stable failure markers in the result payload and
+  // reclassifies as `'error'` before the row is written.
+
+  it('reclassifies a script-gate-fails run as error when the result contains a DB-access-failure marker (#26 Fix B)', async () => {
+    const MAIN_GROUP = {
+      name: 'Main',
+      folder: 'main',
+      trigger: 'always',
+      added_at: '2026-01-01T00:00:00.000Z',
+      isMain: true,
+    };
+
+    createTask({
+      id: 'heartbeat-untrusted-fail',
+      group_folder: 'main',
+      chat_jid: 'main@g.us',
+      prompt: 'heartbeat',
+      script: 'echo \'{"wakeAgent":true,"data":{"error":"DB access failed"}}\'',
+      schedule_type: 'interval',
+      schedule_value: '900000',
+      context_mode: 'isolated',
+      next_run: new Date(Date.now() - 1000).toISOString(),
+      status: 'active',
+      created_at: '2026-01-01T00:00:00.000Z',
+    });
+
+    // Simulate the production failure mode: the container reports
+    // `status: 'success'` even though the gate script's payload tells
+    // the agent the DB couldn't be opened. The agent's reasoning
+    // arrives wrapped in `<internal>` tags so the user-visible
+    // cleanResult is empty — but the raw result still carries the
+    // marker the orchestrator must key on.
+    mockRunContainerAgent.mockImplementation(
+      async (_group, _input, _onProc, onOutput) => {
+        const failingResult =
+          '<internal>DB access failed — unable to open /workspace/store/messages.db. Unanswered list is empty as a result.</internal>';
+        await onOutput!({
+          status: 'success',
+          result: failingResult,
+        } as ContainerOutput);
+        return { status: 'success', result: failingResult };
+      },
+    );
+
+    const enqueueTask = vi.fn(
+      (
+        _groupJid: string,
+        _taskId: string,
+        _sessionName: string,
+        fn: () => Promise<void>,
+      ) => {
+        void fn();
+      },
+    );
+
+    startSchedulerLoop({
+      registeredGroups: () => ({ 'main@g.us': MAIN_GROUP }),
+      getSessions: () => ({}),
+      queue: { enqueueTask, closeStdin: vi.fn() } as never,
+      onProcess: () => {},
+      sendMessage: async () => {},
+    });
+
+    await vi.advanceTimersByTimeAsync(10);
+
+    const logs = getTaskRunLogs('heartbeat-untrusted-fail');
+    expect(logs).toHaveLength(1);
+    // The headline assertion: pre-fix this was 'success'.
+    expect(logs[0].status).toBe('error');
+    // Forensics preserved — raw result still in the row, not nulled.
+    expect(logs[0].result).toContain('DB access failed');
+    // last_result reflects the reclassification so a "broken tasks"
+    // query keying on `Error:` prefix matches.
+    const task = getTaskById('heartbeat-untrusted-fail');
+    expect(task?.last_result).toMatch(/^Error:/);
+  });
+
+  it('reclassifies on `unable to open` and `env-warning:` markers too (broader-marker coverage)', async () => {
+    const MAIN_GROUP = {
+      name: 'Main',
+      folder: 'main',
+      trigger: 'always',
+      added_at: '2026-01-01T00:00:00.000Z',
+      isMain: true,
+    };
+
+    // Two due tasks, two distinct marker phrases — each must reclassify.
+    // Prompts double as routing keys for the mock's per-task payload.
+    createTask({
+      id: 'marker-unable-to-open',
+      group_folder: 'main',
+      chat_jid: 'main@g.us',
+      prompt: 'unable',
+      schedule_type: 'once',
+      schedule_value: '2026-01-01T00:00:00.000Z',
+      context_mode: 'isolated',
+      next_run: new Date(Date.now() - 2000).toISOString(),
+      status: 'active',
+      created_at: '2026-01-01T00:00:00.000Z',
+    });
+    createTask({
+      id: 'marker-env-warning',
+      group_folder: 'main',
+      chat_jid: 'main@g.us',
+      prompt: 'envwarn',
+      schedule_type: 'once',
+      schedule_value: '2026-01-01T00:00:00.000Z',
+      context_mode: 'isolated',
+      next_run: new Date(Date.now() - 1000).toISOString(),
+      status: 'active',
+      created_at: '2026-01-01T00:00:00.000Z',
+    });
+
+    const resultByPrompt: Record<string, string> = {
+      unable:
+        '<internal>sqlite3.OperationalError: unable to open database file</internal>',
+      envwarn:
+        '<internal>env-warning: NANOCLAW_DB=/bad path; using default</internal>',
+    };
+
+    mockRunContainerAgent.mockImplementation(
+      async (_group, input, _onProc, onOutput) => {
+        const out = resultByPrompt[input.prompt as string];
+        await onOutput!({
+          status: 'success',
+          result: out,
+        } as ContainerOutput);
+        return { status: 'success', result: out };
+      },
+    );
+
+    const enqueueTask = vi.fn(
+      (
+        _groupJid: string,
+        _taskId: string,
+        _sessionName: string,
+        fn: () => Promise<void>,
+      ) => {
+        void fn();
+      },
+    );
+
+    startSchedulerLoop({
+      registeredGroups: () => ({ 'main@g.us': MAIN_GROUP }),
+      getSessions: () => ({}),
+      queue: { enqueueTask, closeStdin: vi.fn() } as never,
+      onProcess: () => {},
+      sendMessage: async () => {},
+    });
+
+    await vi.advanceTimersByTimeAsync(10);
+
+    for (const id of ['marker-unable-to-open', 'marker-env-warning']) {
+      const logs = getTaskRunLogs(id);
+      expect(logs).toHaveLength(1);
+      expect(logs[0].status).toBe('error');
+    }
+  });
+
+  it('does NOT reclassify a clean success run (negative case)', async () => {
+    const MAIN_GROUP = {
+      name: 'Main',
+      folder: 'main',
+      trigger: 'always',
+      added_at: '2026-01-01T00:00:00.000Z',
+      isMain: true,
+    };
+
+    createTask({
+      id: 'clean-success-task',
+      group_folder: 'main',
+      chat_jid: 'main@g.us',
+      prompt: 'check',
+      schedule_type: 'once',
+      schedule_value: '2026-01-01T00:00:00.000Z',
+      context_mode: 'isolated',
+      next_run: new Date(Date.now() - 1000).toISOString(),
+      status: 'active',
+      created_at: '2026-01-01T00:00:00.000Z',
+    });
+
+    mockRunContainerAgent.mockImplementation(
+      async (_group, _input, _onProc, onOutput) => {
+        await onOutput!({
+          status: 'success',
+          result: '<internal>All quiet, nothing to do.</internal>',
+        } as ContainerOutput);
+        return {
+          status: 'success',
+          result: '<internal>All quiet, nothing to do.</internal>',
+        };
+      },
+    );
+
+    const enqueueTask = vi.fn(
+      (
+        _groupJid: string,
+        _taskId: string,
+        _sessionName: string,
+        fn: () => Promise<void>,
+      ) => {
+        void fn();
+      },
+    );
+
+    startSchedulerLoop({
+      registeredGroups: () => ({ 'main@g.us': MAIN_GROUP }),
+      getSessions: () => ({}),
+      queue: { enqueueTask, closeStdin: vi.fn() } as never,
+      onProcess: () => {},
+      sendMessage: async () => {},
+    });
+
+    await vi.advanceTimersByTimeAsync(10);
+
+    const logs = getTaskRunLogs('clean-success-task');
+    expect(logs).toHaveLength(1);
+    expect(logs[0].status).toBe('success');
   });
 });

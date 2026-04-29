@@ -143,6 +143,45 @@ export const DORMANT_WARN_COOLDOWN_MS = 24 * 60 * 60 * 1000;
  */
 const lastDormantWarnAt = new Map<string, number>();
 
+/**
+ * Markers in a scheduled task's `result` payload that indicate the
+ * gate script (or its precheck wrapper) hit a hard failure even though
+ * the container reported `status: 'success'` upstream. The gate-script
+ * exit-code IS the source of truth for these tasks (per the
+ * `check-unanswered.py` docstring contract: exit 1 = hard failure), but
+ * by the time the agent has wrapped the script's degraded payload into
+ * an `<internal>...</internal>` reasoning block, the orchestrator only
+ * sees the agent's "success" status. Reclassifying on these substrings
+ * stops `task_run_logs` from logging script failures as `'success'` and
+ * keeps the run-log table honest. Closes #26 (Fix B).
+ *
+ * - `DB access failed` — emitted by `check-unanswered.py` on
+ *   `sqlite3.Error` (incl. "unable to open database file").
+ * - `unable to open` — broader sqlite phrase that survives upstream
+ *   wrapping; matches even when the precheck reformats the failure.
+ * - `env-warning:` — non-fatal config drift the script surfaces in
+ *   its `error` field; not a hard failure on its own, but a
+ *   classification-correctness signal that something operator-visible
+ *   is degraded. We treat it as `'error'` so the run shows up in
+ *   "show me broken tasks" queries rather than vanishing into the
+ *   green-on-green of a 207/207 success run.
+ *
+ * Substring matches, not regex — the markers are stable strings the
+ * scripts emit verbatim. Case-insensitive to absorb future docstring
+ * tweaks.
+ */
+const SCRIPT_FAILURE_MARKERS = [
+  'DB access failed',
+  'unable to open',
+  'env-warning:',
+] as const;
+
+function resultIndicatesScriptFailure(result: string | null): boolean {
+  if (!result) return false;
+  const lower = result.toLowerCase();
+  return SCRIPT_FAILURE_MARKERS.some((m) => lower.includes(m.toLowerCase()));
+}
+
 export interface SchedulerDependencies {
   registeredGroups: () => Record<string, RegisteredGroup>;
   /**
@@ -386,6 +425,25 @@ async function runTask(
   const durationMs = Date.now() - startTime;
 
   const nextRun = computeNextRun(task);
+
+  // Reclassify gate-script failures that the container masked as success.
+  // When the gate script (or its precheck) hits a hard error — e.g. the
+  // untrusted-tier heartbeat losing read access to `messages.db` — the
+  // agent dutifully writes the failure note inside `<internal>` tags and
+  // the container reports `status: 'success'`. Without this check the
+  // orchestrator would log every such run as `success`, hiding 96
+  // wasted wake-ups/day on `heartbeat-telegram_old-wtf` (#26). Match
+  // happens BEFORE the row is written so a single source of truth for
+  // status flows into both `task_run_logs.status` and the user-visible
+  // `last_result`/`Error: ...` summary.
+  if (!error && resultIndicatesScriptFailure(result)) {
+    error = `Script-gate failure detected in result payload: ${(result ?? '').slice(0, 200)}`;
+    logger.warn(
+      { taskId: task.id, group: task.group_folder },
+      'Reclassified task run as error: gate-script failure marker present in result',
+    );
+  }
+
   const resultSummary = error
     ? `Error: ${error}`
     : result
