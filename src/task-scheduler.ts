@@ -10,6 +10,7 @@ import {
 } from './container-runner.js';
 import { stopContainer } from './container-runtime.js';
 import { MAINTENANCE_SESSION_NAME } from './group-queue.js';
+import { captureWedgeDiagnostics } from './wedge-diagnostics.js';
 import {
   deleteTask,
   getAllTasks,
@@ -378,10 +379,27 @@ async function runTask(
       },
       'Task watchdog: killing container after hard timeout',
     );
+    // Capture diagnostics BEFORE the kill: docker stats / exec / logs
+    // / /proc/<pid>/wchan all need a live container to read from. The
+    // helper is bounded to ~5s and best-effort; failure here must not
+    // skip the kill below (#40 instrumentation).
+    let diagPath: string | null = null;
     if (runningContainerName) {
+      diagPath = captureWedgeDiagnostics(
+        runningContainerName,
+        {
+          taskId: task.id,
+          scheduleType: task.schedule_type,
+          prompt: task.prompt,
+          sessionId,
+          runStartIso: new Date(startTime).toISOString(),
+        },
+        `task-timeout-${timeoutMin}min`,
+      );
       stopContainer(runningContainerName);
     }
-    error = `task watchdog: killed container after ${timeoutMin}min`;
+    const baseMsg = `task watchdog: killed container after ${timeoutMin}min`;
+    error = diagPath ? `${baseMsg} (diag: ${diagPath})` : baseMsg;
     watchdogResolve(WATCHDOG_TIMEOUT);
   }, TASK_RUN_TIMEOUT_MS);
 

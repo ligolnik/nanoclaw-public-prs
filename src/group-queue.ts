@@ -8,6 +8,7 @@ import {
   sessionInputDirName,
 } from './container-runner.js';
 import { logger } from './logger.js';
+import { captureWedgeDiagnostics } from './wedge-diagnostics.js';
 
 // Re-export so callers that already imported it from group-queue keep working.
 // Container-runner is the canonical definer — this file, the task-scheduler,
@@ -204,11 +205,29 @@ export class GroupQueue {
       for (const state of sessions.values()) {
         if (state.pendingTasks.length === 0) continue;
         const kept: QueuedTask[] = [];
+        // Capture diagnostics at most once per wedged slot per sweep:
+        // the same container is responsible for every task we're about
+        // to drop, so re-running ten 5s captures back-to-back would
+        // both waste budget and rate-limit useful evidence.
+        let diagPath: string | null | undefined = undefined;
         for (const t of state.pendingTasks) {
           const ageMs = now - t.enqueuedAt;
           if (ageMs >= threshold) {
             const ageMin = Math.round(ageMs / 60_000);
-            const error = `dispatch dropped: maintenance slot wedged for ${ageMin}min`;
+            if (diagPath === undefined) {
+              diagPath = state.containerName
+                ? captureWedgeDiagnostics(
+                    state.containerName,
+                    {
+                      taskId: t.id,
+                      runStartIso: new Date(t.enqueuedAt).toISOString(),
+                    },
+                    `dispatch-drop-${ageMin}min`,
+                  )
+                : null;
+            }
+            const baseMsg = `dispatch dropped: maintenance slot wedged for ${ageMin}min`;
+            const error = diagPath ? `${baseMsg} (diag: ${diagPath})` : baseMsg;
             logger.error(
               {
                 taskId: t.id,
@@ -216,6 +235,7 @@ export class GroupQueue {
                 sessionName: t.sessionName,
                 ageMs,
                 thresholdMs: threshold,
+                diagPath,
               },
               'Dispatch-loss watchdog dropping stale pending task',
             );
