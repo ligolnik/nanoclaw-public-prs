@@ -1380,14 +1380,16 @@ function buildContainerArgs(
     // Agent can read CLAUDE.md/skills but can't write 7GB of numbers.
   } else {
     // Trusted/main: cap memory to prevent host OOM when multiple containers
-    // run in parallel. The NAS has 7.5GB RAM total; without a cap, multiple
-    // Claude SDK processes can exhaust host memory and trigger kernel OOM
-    // killer (SIGKILL exit 137). 1.5GB is plenty for Claude Code + skills.
+    // run in parallel, while leaving enough headroom that long-running
+    // sessions with growing cache don't get SIGKILL'd mid-turn (exit 137).
+    // 1.5GB / 2GB-swap was hitting the cap on heavy main sessions where
+    // Node + SDK + MCP servers + skill subagent prompt + cache_read climbed
+    // past the limit after a few hundred seconds (see issue #49).
     args.push(
       '--memory',
-      '1536m', // 1.5GB RAM hard limit
+      '2048m', // 2GB RAM hard limit
       '--memory-swap',
-      '2048m', // allow 512MB swap as buffer
+      '3072m', // 1GB swap as buffer
     );
   }
 
