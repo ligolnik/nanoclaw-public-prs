@@ -1280,7 +1280,7 @@ async function runQuery(
   const erroredWithoutProgress =
     !lastAssistantUuid && totalOutputTokens === 0 && messageCount <= 2;
   log(
-    `Query done. Messages: ${messageCount}, results: ${resultCount}, lastAssistantUuid: ${lastAssistantUuid || 'none'}, closedDuringQuery: ${closedDuringQuery}, erroredWithoutProgress: ${erroredWithoutProgress}, wall=${elapsedMs}ms, tokens_in=${totalInputTokens}, tokens_out=${totalOutputTokens}, cache_read=${totalCacheRead}, cache_create=${totalCacheCreation}, cache_hit_rate=${hitRate}%`,
+    `Query done. Messages: ${messageCount}, results: ${resultCount}, lastAssistantUuid: ${lastAssistantUuid || 'none'}, closedDuringQuery: ${closedDuringQuery}, erroredWithoutProgress: ${erroredWithoutProgress}, wall=${elapsedMs}ms, model=${process.env.AGENT_MODEL || 'opus[1m]'}, tokens_in=${totalInputTokens}, tokens_out=${totalOutputTokens}, cache_read=${totalCacheRead}, cache_create=${totalCacheCreation}, cache_hit_rate=${hitRate}%`,
   );
   return {
     newSessionId,
