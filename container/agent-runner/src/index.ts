@@ -611,6 +611,18 @@ async function runQuery(
   // has been read into a string that becomes the next runQuery's prompt.
   let ipcPolling = true;
   let closedDuringQuery = false;
+  // Hard-exit watchdog (#57): once the host writes `_close` we have
+  // committed to ending this container. `stream.end()` only signals "no
+  // more user messages" to the SDK — a model mid-tool-call (or a wedged
+  // MCP server) can keep the iterator alive long after the host gave up.
+  // Without a hard cap the container then sits idle until
+  // `CONTAINER_TIMEOUT` (30 min) reaps it, which is exactly the
+  // maintenance-slot wedge the issue documents: heartbeat container
+  // ran 30:01 min after deciding to stop. 30s is enough for a real
+  // tool call to complete and for the SDK's natural cleanup to drain;
+  // anything longer is the SDK refusing to give up. process.exit(0)
+  // because everything we wanted to emit was already written.
+  const POST_CLOSE_DRAIN_GRACE_MS = 30_000;
   const pollIpcDuringQuery = () => {
     if (!ipcPolling) return;
     if (shouldClose()) {
@@ -618,6 +630,12 @@ async function runQuery(
       closedDuringQuery = true;
       stream.end();
       ipcPolling = false;
+      setTimeout(() => {
+        log(
+          `Post-close grace expired (${POST_CLOSE_DRAIN_GRACE_MS}ms) — SDK iterator still alive, force-exiting to release maintenance slot`,
+        );
+        process.exit(0);
+      }, POST_CLOSE_DRAIN_GRACE_MS).unref();
       return;
     }
     setTimeout(pollIpcDuringQuery, IPC_POLL_MS);
@@ -628,6 +646,15 @@ async function runQuery(
   let lastAssistantUuid: string | undefined;
   let messageCount = 0;
   let resultCount = 0;
+  // Track whether we emitted a terminal `result` SDK event during this
+  // runQuery. Used post-loop to synthesize a `status: 'success'` payload
+  // when the SDK iterator drains without ever firing `result` (#57).
+  // Without the synthesized payload, the host's task-scheduler never
+  // sees a terminal-success streaming output and `scheduleClose` may not
+  // fire — leaving the container idle until `IDLE_TIMEOUT` (30 min) reaps
+  // it. The smoking-gun row in #57 was a heartbeat that stopped silently
+  // and then ran 30:01 min before being killed.
+  let emittedTerminalSuccess = false;
   // Track whether the agent invoked an explicit user-facing send tool
   // AND the tool actually succeeded during this query. If so, the SDK's
   // final `result.text` is a closing-thought / summary aimed at the
@@ -1211,6 +1238,7 @@ async function runQuery(
         result: suppressFinalText ? null : textResult || null,
         newSessionId,
       });
+      emittedTerminalSuccess = true;
       // Break out of the for-await loop after receiving the result.
       // Without this, the iterator hangs waiting for more SDK messages
       // that will never come, and follow-up IPC messages are lost.
@@ -1221,6 +1249,36 @@ async function runQuery(
   }
 
   ipcPolling = false;
+
+  // Issue #57 — silent-stop terminal success synthesis.
+  //
+  // The SDK's `query()` iterator can drain (loop ends naturally) without
+  // ever yielding a `result` event. Reproducible cases include:
+  //   - Agent emits an internal-only assistant turn ("Stopping silently
+  //     per instructions") and the SDK closes the iterator without a
+  //     terminal `result.subtype: 'success'` event.
+  //   - Streaming chunks arrive (some `streamText` writes happen) but
+  //     the conversation closes before a final `result` lands.
+  //
+  // Without a synthesized terminal write here, the host's task-scheduler
+  // never sees a streaming output with `status: 'success'` AND a finalized
+  // shape (the `result` SDK event is what triggers `scheduleClose`'s 10s
+  // teardown timer in `src/task-scheduler.ts:485`). The container then
+  // sits in `waitForIpcMessage` polling for IPC that never comes, until
+  // `CONTAINER_TIMEOUT` (30 min) reaps it — silently swallowing every
+  // queued maintenance task behind it.
+  //
+  // The synthesized payload mirrors the "ran successfully but the model
+  // chose not to emit final text" shape (result: '', not null — null
+  // collides with our intermediate streamText updates). The host then
+  // fires `scheduleClose` and the container drains within 10s.
+  if (!closedDuringQuery && !emittedTerminalSuccess) {
+    log(
+      `SDK iterator drained without emitting result event — synthesizing terminal success so host can schedule teardown (#57)`,
+    );
+    writeOutput({ status: 'success', result: '', newSessionId });
+    emittedTerminalSuccess = true;
+  }
 
   // Now that the turn has fully landed, finalize the resume point. If the
   // latest assistant turn was thinking-only + end_turn (a pseudo-turn the
