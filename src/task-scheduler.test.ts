@@ -1226,7 +1226,7 @@ describe('task scheduler', () => {
   });
 
   it('recurring task persists newSessionId on first fire and resumes it on second fire (#59)', async () => {
-    const MAIN_GROUP: RegisteredGroup = {
+    const MAIN_GROUP = {
       jid: 'main@g.us',
       name: 'Main',
       folder: 'main',
