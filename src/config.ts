@@ -116,6 +116,50 @@ export const MAX_MESSAGES_PER_PROMPT = Math.max(
 );
 export const IPC_POLL_INTERVAL = 1000;
 export const IDLE_TIMEOUT = parseInt(process.env.IDLE_TIMEOUT || '1800000', 10); // 30min default — how long to keep container alive after last result
+
+/**
+ * Hard cap on a maintenance-slot container's wall-clock lifetime (#57).
+ *
+ * Maintenance containers are spawned by the task-scheduler (heartbeat,
+ * nightly, weekly, reminders). Unlike user-facing containers — which
+ * keep the same conversation alive for 30 minutes so the user can come
+ * back and continue without losing context — a scheduled task is
+ * single-turn: the scheduler's `scheduleClose` writes `_close` 10s
+ * after the agent emits `status: 'success'`, and the agent exits via
+ * its `waitForIpcMessage` poll loop.
+ *
+ * The 30-min default `CONTAINER_TIMEOUT` therefore only matters for
+ * maintenance containers when something has gone wrong: the agent
+ * silently stopped without emitting a terminal success (the silent-stop
+ * wedge), the SDK iterator hung mid-tool-call, or `closeStdin` failed
+ * to land. In those cases the maintenance slot is single-threaded and
+ * every queued task waits 30 min for the dispatch-loss watchdog
+ * (`group-queue.ts:DISPATCH_DROP_THRESHOLD_MS`) to drop it — exactly
+ * the cascade #57 documents (drive_planner T-30 and T-15 dropped because
+ * a heartbeat container ran 30:01 min after deciding to stop).
+ *
+ * 5 min is generous for any scheduled task: the longest-running ones
+ * (nightly digests, weekly reviews) complete in under a minute of
+ * wall-clock work; anything longer is a wedge. Keeping this floor
+ * shorter than `IDLE_TIMEOUT` is fine because maintenance containers
+ * don't run the idle-waiting loop — they exit on `_close`. The hard
+ * timeout is only the safety net for the failure modes above.
+ *
+ * Configurable via `MAINTENANCE_CONTAINER_TIMEOUT` so ops can tune
+ * without rebuilding. A value <= 0 falls back to the default.
+ */
+const DEFAULT_MAINTENANCE_CONTAINER_TIMEOUT = 5 * 60 * 1000;
+function resolveMaintenanceContainerTimeout(): number {
+  const raw = process.env.MAINTENANCE_CONTAINER_TIMEOUT;
+  if (!raw) return DEFAULT_MAINTENANCE_CONTAINER_TIMEOUT;
+  const parsed = parseInt(raw, 10);
+  if (!Number.isFinite(parsed) || parsed <= 0) {
+    return DEFAULT_MAINTENANCE_CONTAINER_TIMEOUT;
+  }
+  return parsed;
+}
+export const MAINTENANCE_CONTAINER_TIMEOUT =
+  resolveMaintenanceContainerTimeout();
 export const MAX_CONCURRENT_CONTAINERS = Math.max(
   1,
   parseInt(process.env.MAX_CONCURRENT_CONTAINERS || '5', 10) || 5,

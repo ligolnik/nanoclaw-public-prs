@@ -21,6 +21,7 @@ vi.mock('./config.js', () => ({
   HOST_UID: undefined,
   HOST_GID: undefined,
   IDLE_TIMEOUT: 1800000, // 30min
+  MAINTENANCE_CONTAINER_TIMEOUT: 300000, // 5min — maintenance-slot hard cap (#57)
   TILE_OWNER: 'test',
   TIMEZONE: 'America/Los_Angeles',
   MAINTENANCE_RULE_BLOCKLIST: new Set<string>(),
@@ -272,6 +273,76 @@ describe('container-runner timeout behavior', () => {
     const result = await resultPromise;
     expect(result.status).toBe('success');
     expect(result.newSessionId).toBe('session-456');
+  });
+
+  // --- Issue #57: maintenance-slot containers honor the shorter timeout ---
+  //
+  // A wedged maintenance container running to the 30-min default
+  // `CONTAINER_TIMEOUT` is exactly the cascade #57 documents: every
+  // queued task behind it waits 30 min for the dispatch-loss watchdog.
+  // The fix lowers the floor to MAINTENANCE_CONTAINER_TIMEOUT (5 min
+  // default) for any spawn whose `sessionName === 'maintenance'`.
+  it('maintenance-slot containers fire hard timeout at MAINTENANCE_CONTAINER_TIMEOUT (5 min), not the 30-min default (#57)', async () => {
+    const onOutput = vi.fn(async () => {});
+    const maintenanceInput = {
+      ...testInput,
+      sessionName: 'maintenance',
+    };
+    const resultPromise = runContainerAgent(
+      testGroup,
+      maintenanceInput,
+      () => {},
+      onOutput,
+    );
+
+    // No output emitted — wedge scenario. Advance just past the 5-min
+    // maintenance cap (300_000ms) and verify the timeout fires here,
+    // NOT at the 30-min user-facing floor.
+    await vi.advanceTimersByTimeAsync(300_000 + 100);
+
+    // The kill path calls stopContainer; emit close to drive resolution.
+    fakeProc.emit('close', 137);
+    await vi.advanceTimersByTimeAsync(10);
+
+    const result = await resultPromise;
+    expect(result.status).toBe('error');
+    // Error message references the actual timeoutMs (300_000), not the
+    // 30-min floor — proves the maintenance-slot branch was taken.
+    expect(result.error).toMatch(/timed out after 300000ms/);
+  });
+
+  it('default-slot containers retain the 30-min idle floor (regression guard for the #57 fix)', async () => {
+    const onOutput = vi.fn(async () => {});
+    // No sessionName → defaults to 'default'.
+    const resultPromise = runContainerAgent(
+      testGroup,
+      testInput,
+      () => {},
+      onOutput,
+    );
+
+    // 5 min in, the maintenance cap WOULD have fired if the branch
+    // misbehaved. The default container must still be alive.
+    await vi.advanceTimersByTimeAsync(300_000 + 1000);
+
+    // Process is still alive — emit a streaming output to verify the
+    // promise hasn't resolved yet.
+    emitOutputMarker(fakeProc, {
+      status: 'success',
+      result: 'Mid-run output',
+      newSessionId: 'session-default',
+    });
+    await vi.advanceTimersByTimeAsync(10);
+
+    // Now run the full 30-min idle floor (1.83M ms total) and the close
+    // event — this is the real timeout for default-slot containers.
+    await vi.advanceTimersByTimeAsync(1830000);
+    fakeProc.emit('close', 137);
+    await vi.advanceTimersByTimeAsync(10);
+
+    const result = await resultPromise;
+    // Had streaming output → resolves as success (idle cleanup), not error.
+    expect(result.status).toBe('success');
   });
 });
 

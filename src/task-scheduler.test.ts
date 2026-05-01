@@ -1927,4 +1927,104 @@ describe('task scheduler', () => {
     // returns null (logAndUpdateTask CASE).
     expect(finalTask?.status).toBe('completed');
   });
+
+  // --- Issue #57: scheduleClose fires on synthesized terminal success ---
+  //
+  // Layer 1 of the #57 fix has the agent-runner synthesize a terminal
+  // `{status: 'success', result: ''}` payload when the SDK iterator
+  // drains without firing a `result` event (silent-stop case). The
+  // host's `runTask` must treat that synthesized payload exactly like
+  // any other terminal success — i.e. fire `scheduleClose`, which writes
+  // `_close` after `TASK_CLOSE_DELAY_MS` (10s) and lets the maintenance
+  // slot drain. Without this guarantee a synthesized success would still
+  // leave the container idling until `IDLE_TIMEOUT` reaps it (30 min),
+  // recreating the very wedge #57 documents.
+  it('scheduleClose fires on a synthesized terminal success (#57 Layer 1 host plumbing)', async () => {
+    const MAIN_GROUP = {
+      name: 'Main',
+      folder: 'main',
+      trigger: 'always',
+      added_at: '2026-04-29T00:00:00.000Z',
+      isMain: true,
+    };
+
+    createTask({
+      id: 'silent-stop-task',
+      group_folder: 'main',
+      chat_jid: 'main@g.us',
+      prompt: 'check unanswered',
+      schedule_type: 'once',
+      schedule_value: '2026-04-29T00:00:00.000Z',
+      context_mode: 'group',
+      next_run: new Date(Date.now() - 1000).toISOString(),
+      status: 'active',
+      created_at: '2026-04-29T00:00:00.000Z',
+    });
+
+    // Simulate the silent-stop path: agent-runner's runQuery loop drains
+    // without yielding a `result` event, so the synthesized payload
+    // arrives as `{status: 'success', result: ''}` (empty string, not
+    // null — null collides with intermediate streamText updates). The
+    // container then HANGS — does not exit naturally — exactly the
+    // wedge shape #57 documents (host saw success, container ran 30:01).
+    // scheduleClose's 10s timer is the ONLY thing that can free the
+    // maintenance slot in this branch.
+    let resolveContainer: (out: ContainerOutput) => void;
+    const containerSettled = new Promise<ContainerOutput>((resolve) => {
+      resolveContainer = resolve;
+    });
+    mockRunContainerAgent.mockImplementation(
+      async (_group, _input, _onProc, onOutput) => {
+        await onOutput({
+          status: 'success',
+          result: '',
+          newSessionId: 'silent-stop-session',
+        } as ContainerOutput);
+        // Hang here to mimic the wedged-container shape: the streaming
+        // success has arrived but the container hasn't exited yet.
+        // scheduleClose's 10s timer must fire and call closeStdin even
+        // though the container promise is still pending.
+        return containerSettled;
+      },
+    );
+
+    const closeStdin = vi.fn();
+    const enqueueTask = vi.fn(
+      (
+        _groupJid: string,
+        _taskId: string,
+        _sessionName: string,
+        fn: () => Promise<void>,
+      ) => {
+        void fn();
+      },
+    );
+
+    startSchedulerLoop({
+      registeredGroups: () => ({ 'main@g.us': MAIN_GROUP }),
+      getSessions: () => ({}),
+      queue: { enqueueTask, closeStdin } as never,
+      onProcess: () => {},
+      sendMessage: async () => {},
+    });
+
+    // Let the scheduler fire and the streaming onOutput resolve.
+    await vi.advanceTimersByTimeAsync(10);
+
+    // The 10s scheduleClose timer hasn't fired yet — closeStdin not called.
+    expect(closeStdin).not.toHaveBeenCalled();
+
+    // Advance past TASK_CLOSE_DELAY_MS (10s) — closeStdin must now fire,
+    // targeting the maintenance slot for this group's chat_jid.
+    await vi.advanceTimersByTimeAsync(11_000);
+
+    expect(closeStdin).toHaveBeenCalledWith(
+      'main@g.us',
+      MAINTENANCE_SESSION_NAME,
+    );
+
+    // Release the container so the test doesn't leak a pending promise.
+    resolveContainer!({ status: 'success', result: '' } as ContainerOutput);
+    await vi.advanceTimersByTimeAsync(10);
+  });
 });

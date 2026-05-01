@@ -21,6 +21,7 @@ import {
   HOST_PROJECT_ROOT,
   HOST_UID,
   IDLE_TIMEOUT,
+  MAINTENANCE_CONTAINER_TIMEOUT,
   MAINTENANCE_RULE_BLOCKLIST,
   MAINTENANCE_SKILL_BLOCKLIST,
   STORE_DIR,
@@ -1963,9 +1964,20 @@ export async function runContainerAgent(
         ? CONTAINER_TIMEOUT
         : UNTRUSTED_TIMEOUT;
     const configTimeout = group.containerConfig?.timeout || defaultTimeout;
-    // Grace period: hard timeout must be at least IDLE_TIMEOUT + 30s so the
-    // graceful _close sentinel has time to trigger before the hard kill fires.
-    const timeoutMs = Math.max(configTimeout, IDLE_TIMEOUT + 30_000);
+    // Maintenance-slot containers (#57): scheduled tasks are single-turn
+    // and the scheduler's `scheduleClose` writes `_close` 10s after the
+    // agent emits success. They never need the 30-min idle window the
+    // user-facing default container relies on. Use the dedicated
+    // `MAINTENANCE_CONTAINER_TIMEOUT` (5 min default) and BYPASS the
+    // `IDLE_TIMEOUT + 30s` floor below — that floor exists to give the
+    // user-facing graceful-close sentinel room, which doesn't apply to
+    // maintenance. Without this bypass a single silent-stop wedge takes
+    // out 30 minutes of queued maintenance work behind it (the cascade
+    // documented in #57).
+    const isMaintenanceSlot = input.sessionName === MAINTENANCE_SESSION_NAME;
+    const timeoutMs = isMaintenanceSlot
+      ? MAINTENANCE_CONTAINER_TIMEOUT
+      : Math.max(configTimeout, IDLE_TIMEOUT + 30_000);
 
     const killOnTimeout = () => {
       timedOut = true;
@@ -2053,7 +2065,7 @@ export async function runContainerAgent(
         resolve({
           status: 'error',
           result: null,
-          error: `Container timed out after ${configTimeout}ms`,
+          error: `Container timed out after ${timeoutMs}ms`,
         });
         return;
       }
