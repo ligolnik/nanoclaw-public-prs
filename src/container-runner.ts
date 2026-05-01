@@ -353,6 +353,8 @@ export function createFilteredDb(
   // setting, not a database-level property. Without it the ATTACH + CTAS
   // reads below would return SQLITE_BUSY immediately if the orchestrator is
   // mid-write, which can cause a transient "malformed image" failure.
+  // Source `messages.db` is WAL-mode and actively written by the orchestrator;
+  // matching the orchestrator's 5000ms keeps contention smoothing symmetric.
   //
   // journal_mode is DELETE (the SQLite default) — NOT WAL. This filtered
   // copy is a one-shot snapshot mounted read-only into untrusted containers
