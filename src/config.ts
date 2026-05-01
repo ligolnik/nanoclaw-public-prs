@@ -54,12 +54,33 @@ export const HOST_PROJECT_ROOT = process.env.HOST_PROJECT_ROOT || PROJECT_ROOT;
 //   3. The call-site `?? 1000` last-resort fallback — used only when
 //      neither an env override nor process.getuid/getgid is available
 //      (e.g. Windows, where process.getuid is undefined).
-export const HOST_UID = process.env.HOST_UID
-  ? parseInt(process.env.HOST_UID, 10)
-  : process.getuid?.();
-export const HOST_GID = process.env.HOST_GID
-  ? parseInt(process.env.HOST_GID, 10)
-  : process.getgid?.();
+//
+// Validation: a set-but-malformed value (`HOST_UID=foo` → NaN, or
+// `HOST_UID=-1`) becomes `undefined` here so we fall through to
+// `process.getuid()` instead of forwarding the malformed value into
+// `fs.chownSync` — `NaN` throws there, `-1` casts to uid 4294967295
+// and silently mis-owns. A stderr warning surfaces the operator typo
+// at startup; without it, the misconfig looks identical to "not
+// running in DooD" and the original permission issue is invisible
+// (jbaruch/nanoclaw#258). Stderr (not `logger`) keeps `config.ts`
+// below `logger.ts` in the import graph.
+export function parseHostId(name: 'HOST_UID' | 'HOST_GID'): number | undefined {
+  const raw = process.env[name];
+  if (raw === undefined) return undefined;
+  // Strict digits-only match: `parseInt` would silently accept partial
+  // parses (`"123abc"` → 123, `"1.5"` → 1) and `!raw` would treat an
+  // explicit empty string as "unset" — both shapes are operator typos
+  // we want to surface, not absorb.
+  if (!/^\d+$/.test(raw)) {
+    process.stderr.write(
+      `[config] ${name}="${raw}" is not a non-negative integer — ignoring; chowns to host user will fall back to process uid/gid (or default 1000).\n`,
+    );
+    return undefined;
+  }
+  return parseInt(raw, 10);
+}
+export const HOST_UID = parseHostId('HOST_UID') ?? process.getuid?.();
+export const HOST_GID = parseHostId('HOST_GID') ?? process.getgid?.();
 
 // Mount security: allowlist stored OUTSIDE project root, never mounted into containers
 export const MOUNT_ALLOWLIST_PATH =
